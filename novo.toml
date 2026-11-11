@@ -1,0 +1,33 @@
+[package]
+name        = "sgtl5000-nv"
+version     = "0.1.0"
+description = "A driver for NXP's SGTL5000 low-power stereo codec with headphone amplifier on an I2C control bus with 16-bit registers and a board's I2S handle: the chip ID, the power-up sequence of the data sheet in its order for an internal or external VDDD and for low and high supplies, the clock from SYS_FS and the MCLK ratio or the PLL, the I2S port, the routing, the DAC volume ramp and mute, the headphone and line-out volumes and mutes, the input choice, the microphone gain and bias, as devices-nv's AudioCodec and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["sgtl5000", "nxp", "freescale", "teensy", "codec", "audio", "dac", "adc", "i2s", "i2c", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/sgtl5000-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Playing and recording sound through an SGTL5000 codec"
+
+# Every module of the package checks at the embedded tier, so a program
+# of any tier, embedded, rt or system, may call it.
+[tier]
+tier = "embedded"
+
+# The device program, examples/headphones.nv, has no [[bin]] entry: an entry
+# makes the registry list the package as a program.  tests/device_build.sh
+# builds the program for two boards as the main of a scratch package that
+# depends on this one.
+
+[dependencies]
+# The board's I2C handle, the I2cBus, Timer and I2s traits and the I2S
+# settings.
+embedded-hal-nv = "^0.3.3"
+# The wiring record, the register helpers, and the AudioCodec and
+# Identifiable traits.
+devices-nv      = "^0.3.3"

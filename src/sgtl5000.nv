@@ -1,0 +1,1016 @@
+// sgtl5000 — NXP's SGTL5000, a low-power stereo codec with a headphone
+// amplifier, line input and output, a microphone amplifier, an I2C control
+// port with 16-bit registers and an I2S/PCM serial audio port, as
+// devices-nv's `AudioCodec` and `Identifiable`.
+//
+// The facts below are from NXP's data sheet "SGTL5000: Low Power Stereo
+// Codec with Headphone Amp", Document Number SGTL5000, Rev. 7, 1/2022
+// (the document of nxp.com).  Its tables are named by number.  The reference
+// drivers were read for their fixes and not ported: the Linux kernel's
+// `sound/soc/codecs/sgtl5000.c` and Paul Stoffregen's `control_sgtl5000.cpp`
+// of the Teensy Audio Library.  Where they differ from the data sheet the
+// site says which was taken.
+//
+// The control port.  The I2C address is 0n01010 where n is the CTRL_ADR0_CS
+// pin: 0x0A with it low and 0x2A with it high (the 20-pin package has no such
+// pin and answers at 0x0A).  Every register has a 16-bit address and 16 bits
+// of data, high byte first: a write is the two address bytes then the two data
+// bytes, and a read is the two address bytes, a repeated start and two bytes.
+// The part has no reset register: the internal reset ends 8 SYS_MCLK cycles
+// after the supplies are up, and the part answers on I2C only while SYS_MCLK
+// is present.  So SYS_MCLK has to run before the first access, and a program
+// starts the I2S handle first (`i2s_start`).
+//
+// The registers, as this driver uses them (Tables 16 to 39):
+//
+//   0x0000 CHIP_ID          PARTID (15:8) 0xA0, REVID (7:0)
+//   0x0002 CHIP_DIG_POWER   ADC (6), DAC (5), DAP (4), I2S_OUT (1), I2S_IN (0)
+//   0x0004 CHIP_CLK_CTRL    RATE_MODE (5:4), SYS_FS (3:2), MCLK_FREQ (1:0)
+//   0x0006 CHIP_I2S_CTRL    SCLKFREQ (8), MS (7), DLEN (5:4), I2S_MODE (3:2), LRALIGN (1)
+//   0x000A CHIP_SSS_CTRL    DAP_SELECT (7:6), DAC_SELECT (5:4), I2S_SELECT (1:0, write-only)
+//   0x000E CHIP_ADCDAC_CTRL VOL_BUSY (13:12), VOL_RAMP_EN (9), VOL_EXPO_RAMP (8), DAC mute (3:2)
+//   0x0010 CHIP_DAC_VOL     right (15:8) and left (7:0), 0x3C is 0 dB, 0.5 dB steps
+//   0x0020 CHIP_ANA_ADC_CTRL ADC_VOL_M6DB (8), right (7:4), left (3:0), 1.5 dB steps
+//   0x0022 CHIP_ANA_HP_CTRL right (14:8) and left (6:0), 0x18 is 0 dB, 0.5 dB steps
+//   0x0024 CHIP_ANA_CTRL    MUTE_LO (8), SELECT_HP (6), ZCD_HP (5), MUTE_HP (4), SELECT_ADC (2), ZCD_ADC (1), MUTE_ADC (0)
+//   0x0026 CHIP_LINREG_CTRL charge pump source (6:5), VDDD level (3:0)
+//   0x0028 CHIP_REF_CTRL    VAG_VAL (8:4), BIAS_CTRL (3:1), SMALL_POP (0)
+//   0x002A CHIP_MIC_CTRL    BIAS_RESISTOR (9:8), BIAS_VOLT (6:4), GAIN (1:0)
+//   0x002C CHIP_LINE_OUT_CTRL OUT_CURRENT (11:8), LO_VAGCNTRL (5:0)
+//   0x002E CHIP_LINE_OUT_VOL right (12:8) and left (4:0)
+//   0x0030 CHIP_ANA_POWER   the power bits of the analogue blocks
+//   0x0032 CHIP_PLL_CTRL    INT_DIVISOR (15:11), FRAC_DIVISOR (10:0)
+//   0x0034 CHIP_CLK_TOP_CTRL ENABLE_INT_OSC (11), INPUT_FREQ_DIV2 (3)
+//   0x0036 CHIP_ANA_STATUS  LRSHORT_STS (9), CSHORT_STS (8), PLL_IS_LOCKED (4)
+//   0x003C CHIP_SHORT_CTRL  the headphone short detectors
+//
+// The power-up (data sheet, "Chip Powerup and Supply Configurations").  The
+// steps depend on how the part is supplied and `step_power_up` follows them in
+// order: with VDDD made by the chip, LINREG_CTRL 0x0008 and ANA_POWER 0x7260,
+// and with VDDD external, ANA_POWER with the startup bits cleared; with
+// neither VDDA nor VDDIO at 3.1 V, the internal oscillator and the charge pump;
+// with both above it, the charge pump source set to VDDIO.  Then VAG to VDDA/2
+// in REF_CTRL, the line-out reference and bias current in LINE_OUT_CTRL, the
+// slow ramp bit, the short detectors, the mutes with the zero-cross detectors
+// on in ANA_CTRL, the power of the line out, headphone, ADC and DAC in
+// ANA_POWER, the digital blocks in DIG_POWER, and the line-out level.  The
+// data sheet's example, for VDDIO 3.3 V, VDDA 1.8 V and an internal VDDD, is
+// LINREG_CTRL 0x0008, ANA_POWER 0x7260, REF_CTRL 0x004E, LINE_OUT_CTRL 0x0322,
+// REF_CTRL 0x004F, SHORT_CTRL 0x1106, ANA_CTRL 0x0133, ANA_POWER 0x6AFF,
+// DIG_POWER 0x0073 and LINE_OUT_VOL 0x0505, which is what the tests pin.
+//
+// The clock.  SYS_MCLK is 256, 384 or 512 times SYS_FS (only 256 at 96 kHz),
+// where SYS_FS is 32, 44.1, 48 or 96 kHz and RATE_MODE divides it by 2, 4 or 6
+// for the other rates.  MCLK_FREQ is relative to SYS_FS and not to the rate:
+// 16 kHz is SYS_FS 32 kHz with RATE_MODE 1/2, so its synchronous clock is
+// 8.192 MHz and not 4.096 MHz.  Any other clock from 8 to 27 MHz goes through
+// the PLL (MCLK_FREQ 3), which needs the part as I2S master.  For a PLL
+// output of 196.608 MHz (180.6336 MHz at SYS_FS 44.1 kHz), INT_DIVISOR is
+// the integer part of output over input and FRAC_DIVISOR the fraction times
+// 2048, with the input halved above 17 MHz: for 12 MHz at 48 kHz the divisors
+// are 16 and 786, as in the data sheet.
+//
+// Disagreements between the documents and the reference drivers, and what was
+// taken:
+//   * The charge pump bit.  The data sheet's example writes ANA_POWER 0x6AFF,
+//     with the charge pump on, for VDDIO 3.3 V and VDDA 1.8 V.  Linux and
+//     the Teensy library leave the pump off when either supply is at 3.1 V
+//     or more.  The pump is on unless both are at 3.1 V or more, which is the
+//     data sheet's example and, in the other two cases, all three sources.
+//   * External VDDD.  The data sheet writes ANA_POWER 0x4260, which keeps the
+//     primary VDDD regulator's bit 9 set; Linux and the Teensy library write
+//     0x4060.  0x4060 is taken, because the regulator is not wanted.
+//   * The line-out level.  The data sheet's formula gives 4.5 for its example
+//     and says to use 5, and its Table 32 gives 6 for 5.56; the value is the
+//     formula rounded up.  Linux computes the ratio of the two register codes
+//     and not of the two voltages, which is a different number.
+//   * VAG left on.  A part whose VAG was powered by an earlier run pops when
+//     ANA_POWER is written with it off.  `step_quiet` mutes everything, and
+//     if VAG is on it clears it and waits for the ramp down (Linux: 500 ms).
+//   * The ramp before the unmute.  The DAC's volume ramp (VOL_RAMP_EN) makes
+//     the DAC mute soft; muting waits for the ramp to end before the analogue
+//     mutes are set, and unmuting sets the analogue unmutes first, so the DAC
+//     comes up from silence.  The headphone volume is at its lowest at
+//     power-up (the Teensy library does the same), and the program raises it.
+//   * The wait after the power-up.  The data sheet gives none; the slow VAG
+//     ramp it asks for is about 400 ms, which is also the Teensy library's
+//     wait, and the power-up waits that long.
+//   * ANA_CTRL.  The Teensy library keeps a copy of it; the register reads
+//     back, so this driver reads it.  CHIP_SSS_CTRL's I2S_SELECT is write-only
+//     (Table 20), so the routing is written whole and never read back.
+//   * D_PROGRAMMING.  The data sheet asks for LINREG_SIMPLE_POWERUP and
+//     STARTUP_POWERUP to be cleared after the power-up for the VDDD level to
+//     take effect; the final ANA_POWER write clears STARTUP_POWERUP and keeps
+//     LINREG_SIMPLE_POWERUP as the example does.  The level is not verified.
+
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let CHIP_ID       = 0x0000
+let DIG_POWER     = 0x0002
+let CLK_CTRL      = 0x0004
+let I2S_CTRL      = 0x0006
+let SSS_CTRL      = 0x000A
+let ADCDAC_CTRL   = 0x000E
+let DAC_VOL       = 0x0010
+let ANA_ADC_CTRL  = 0x0020
+let ANA_HP_CTRL   = 0x0022
+let ANA_CTRL      = 0x0024
+let LINREG_CTRL   = 0x0026
+let REF_CTRL      = 0x0028
+let MIC_CTRL      = 0x002A
+let LINE_OUT_CTRL = 0x002C
+let LINE_OUT_VOL  = 0x002E
+let ANA_POWER     = 0x0030
+let PLL_CTRL      = 0x0032
+let CLK_TOP_CTRL  = 0x0034
+let ANA_STATUS    = 0x0036
+let SHORT_CTRL    = 0x003C
+
+// The two-wire addresses: 0n01010, n the CTRL_ADR0_CS pin.
+let ADDR_CS_LOW  = 0x0A
+let ADDR_CS_HIGH = 0x2A
+
+// The part id of CHIP_ID's high byte.
+let PART_ID = 0xA0
+
+// CHIP_ANA_POWER's bits.
+let AP_VAG      = 0x0080
+let AP_PLL      = 0x0400
+let AP_VCOAMP   = 0x0100
+let AP_PLL_BITS = 0x0500
+let AP_STARTUP  = 0x1000
+let AP_PUMP     = 0x0800
+let AP_BLOCKS   = 0x00FF
+let AP_OUTPUTS  = 0x001F
+
+// The values of the power-up of the data sheet.
+let ANA_POWER_INT  = 0x7260
+let ANA_POWER_EXT  = 0x4060
+let LINREG_1V2     = 0x0008
+let LINREG_VDDIO   = 0x0060
+let CLK_TOP_OSC    = 0x0800
+let REF_SLOW_RAMP  = 0x0001
+let LO_CURRENT     = 0x0300
+let SHORT_75MA     = 0x1106
+let ANA_CTRL_MUTED = 0x0133
+let DIG_ALL        = 0x0073
+let ROUTE_CODEC    = 0x0010
+let DAC_RAMP_MUTED = 0x020C
+let DAC_VOL_0DB    = 0x3C3C
+let HP_VOL_LOWEST  = 0x7F7F
+
+// The mute bits.
+let DAC_MUTE_BITS = 0x000C
+let DAC_BUSY_BITS = 0x3000
+let HP_LO_MUTES   = 0x0110
+
+// The waits, in milliseconds.  The VAG ramp down (Linux: 500), the wait after
+// the power-up (the slow ramp, about 400), one poll of the volume ramp and of
+// the PLL.
+let VAG_DOWN_MS = 500
+let RAMP_UP_MS  = 400
+let POLL_MS     = 10
+let POLLS       = 50
+let PLL_POLLS   = 50
+
+// The I2C clock `setup` asks for.
+let I2C_HZ = 400000
+
+// The ranges of the gains, in thousandths of a decibel.  The headphone runs
+// from +12 dB at code 0 to -51.5 dB at code 127 in 0.5 dB steps.  The DAC
+// runs from 0 dB at code 0x3C to -90 dB at code 0xF0 in 0.5 dB steps.  The ADC
+// runs from 0 dB to +22.5 dB in 1.5 dB steps, and from -6 dB to +16.5 dB with
+// ADC_VOL_M6DB.  The microphone amplifier has 0, 20, 30 and 40 dB.
+let HP_MAX_MDB    = 12000
+let HP_MIN_MDB    = -51500
+let HP_STEP_MDB   = 500
+let DAC_MIN_MDB   = -90000
+let DAC_STEP_MDB  = 500
+let DAC_BASE_CODE = 0x3C
+let ADC_MAX_MDB   = 22500
+let ADC_STEP_MDB  = 1500
+let ADC_LOW_MDB   = -6000
+
+// The 10^((i - 15) / 40) * 100 values of the line-out level (Linux's table):
+// the ratio of VAG to the line-out reference, in hundredths, at which the
+// level code `i` is right.
+const LO_QUOT = [
+    42, 45, 47, 50, 53, 56, 60, 63,
+    67, 71, 75, 79, 84, 89, 94, 100,
+    106, 112, 119, 126, 133, 141, 150, 158,
+    168, 178, 188, 200, 211, 224, 237, 251]
+
+// What a program says about how the part is supplied and clocked.
+//
+// `mclk_hz` is the SYS_MCLK the board gives.  `vdda_mv` and `vddio_mv` are
+// the supplies in millivolts, and `vddd_external` whether VDDD is driven from
+// outside and not made by the chip.  `force_pll` takes the PLL even for a
+// clock that is a multiple of SYS_FS.
+pub @value
+struct Sgtl5000Config
+    mclk_hz: Int
+    vdda_mv: Int
+    vddio_mv: Int
+    vddd_external: Bool
+    force_pll: Bool
+
+// VDDA and VDDIO at 3.3 V, VDDD made by the chip, and the clock the board
+// gives.
+pub fn config_default(mclk_hz: Int) -> Sgtl5000Config
+    Sgtl5000Config { mclk_hz: mclk_hz, vdda_mv: 3300, vddio_mv: 3300, vddd_external: false,
+                     force_pll: false }
+
+// The two-wire address for the CTRL_ADR0_CS pin: 0x2A high, 0x0A low.
+pub fn address_of(cs_high: Bool) -> Int
+    if cs_high
+        return ADDR_CS_HIGH
+    ADDR_CS_LOW
+
+// The control port: the I2C bus the codec is on.  `setup` makes the bus
+// ready and answers whether the wiring suits it, `read_word` reads the
+// register `reg`, `write_word` writes it, and `pause_ms` waits.
+pub trait Sgtl5000Port
+    fn setup(self) -> Bool [hw]
+    fn read_word(self, reg: Int) -> ?Int [hw]
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+    fn pause_ms(self, ms: Int) [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// Reads the 16-bit register `reg` in one I2C transaction, the two address
+// bytes and a repeated start; `None` when the part did not answer.
+pub fn i2c_read_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var dst: DevBytes = Vec.new()
+    if not dev_bus.wiring_read16_into(bus, w, reg, 2, var dst)
+        return None
+    if dst.len() != 2
+        return None
+    Some((dst[0] as Int << 8) | dst[1] as Int)
+
+// Writes `v` to the 16-bit register `reg` in one I2C transaction, the two
+// address bytes and the two data bytes: whether the part acknowledged.
+pub fn i2c_write_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((v >> 8) & 0xFF) as u8)
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write16_from(bus, w, reg, src)
+
+// Makes the bus ready at 400 kHz and answers whether the wiring has an
+// address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// ── Registers ────────────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn reg_read<P: Sgtl5000Port>(p: P, reg: Int) -> ?Int [hw]
+    p.read_word(reg)
+
+// Writes `v` to the register `reg`: whether the part acknowledged.
+pub fn reg_write<P: Sgtl5000Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    p.write_word(reg, v & 0xFFFF)
+
+// Sets the bits of `mask` in `reg` to the bits of `flags`, leaving the
+// others, read from the part: whether the part took it.
+pub fn reg_update<P: Sgtl5000Port>(p: P, reg: Int, mask: Int, flags: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, reg) else return false
+    reg_write(p, reg, (old & (0xFFFF ^ mask)) | (flags & mask))
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// The chip ID as a `DeviceId`: `who` is PARTID, 0xA0, and `rev` the REVID
+// byte.  `None` when no part answers or PARTID is not 0xA0.
+pub fn id_read<P: Sgtl5000Port>(p: P) -> ?DeviceId [hw]
+    let Some(v) = reg_read(p, CHIP_ID) else return None
+    if (v >> 8) != PART_ID
+        return None
+    Some(DeviceId { who: PART_ID, rev: Some(v & 0xFF) })
+
+// ── The supplies ─────────────────────────────────────────────────────
+
+// VAG's register code for VDDA / 2: 0.8 V at 0 and 25 mV more per step to
+// 1.575 V at 31.
+pub fn vag_code(vdda_mv: Int) -> Int
+    let c = (vdda_mv / 2 - 800) / 25
+    if c < 0
+        return 0
+    if c > 31
+        return 31
+    c
+
+// The line-out reference's code for VDDIO / 2: 0.8 V at 0 and 25 mV more per
+// step to 1.675 V at 35.
+pub fn lo_code(vddio_mv: Int) -> Int
+    let c = (vddio_mv / 2 - 800) / 25
+    if c < 0
+        return 0
+    if c > 35
+        return 35
+    c
+
+// The bias current code: -50% (7) for a VDDA below 2.7 V, as the data
+// sheet's 1.8 V example, and nominal above it, because the data sheet warns
+// against -50% in its 3.0 V mode.
+pub fn bias_code(vdda_mv: Int) -> Int
+    if vdda_mv < 2700
+        return 7
+    0
+
+// The line-out level code for VAG and the line-out reference in millivolts:
+// 40 * log10(VAG / reference) + 15, rounded up, which is 5 for the data
+// sheet's example (0.9 V and 1.65 V) and the 6, 15 and 25 of its Table 32.
+pub fn lo_vol_code(vag_mv: Int, lo_mv: Int) -> Int
+    if lo_mv <= 0
+        return 15
+    let q = vag_mv * 100 / lo_mv
+    for i in 0..32
+        if LO_QUOT[i] >= q
+            return i
+    31
+
+// Whether both supplies are at 3.1 V or more, where the charge pump takes
+// its source from VDDIO and no oscillator is needed.
+pub fn supplies_high(c: Sgtl5000Config) -> Bool
+    c.vdda_mv >= 3100 and c.vddio_mv >= 3100
+
+// Whether both supplies are below 3.1 V, where the charge pump needs the
+// internal oscillator.
+pub fn supplies_low(c: Sgtl5000Config) -> Bool
+    c.vdda_mv < 3100 and c.vddio_mv < 3100
+
+// ── The clock ────────────────────────────────────────────────────────
+
+// How SYS_MCLK makes the sample clock: `sys_fs` and `rate_mode` are the
+// fields of CLK_CTRL, `mclk_freq` its MCLK_FREQ (0, 1 and 2 for 256, 384 and
+// 512 times SYS_FS, 3 for the PLL), and for the PLL `int_div` and `frac_div`
+// are CHIP_PLL_CTRL's divisors and `div2` is CLK_TOP_CTRL's INPUT_FREQ_DIV2.
+pub @value
+struct SysClock
+    sys_fs: Int
+    rate_mode: Int
+    mclk_freq: Int
+    pll: Bool
+    int_div: Int
+    frac_div: Int
+    div2: Bool
+
+// SYS_FS's code for a rate: 0 for 32 kHz, 1 for 44.1, 2 for 48, 3 for 96,
+// the base the rate is made from; -1 for a rate the part has not.
+pub fn sys_fs_code(rate: Int) -> Int
+    if rate == 32000 or rate == 16000 or rate == 8000
+        return 0
+    if rate == 44100 or rate == 22050 or rate == 11025
+        return 1
+    if rate == 48000 or rate == 24000 or rate == 12000
+        return 2
+    if rate == 96000
+        return 3
+    -1
+
+// RATE_MODE's code for a rate: 0 when SYS_FS is the rate, 1 for half, 2 for a
+// quarter.  The sixth is not used.
+pub fn rate_mode_code(rate: Int) -> Int
+    if rate == 16000 or rate == 22050 or rate == 24000
+        return 1
+    if rate == 8000 or rate == 11025 or rate == 12000
+        return 2
+    0
+
+// SYS_FS in hertz for its code.
+pub fn sys_fs_hz(code: Int) -> Int
+    if code == 0
+        return 32000
+    if code == 1
+        return 44100
+    if code == 2
+        return 48000
+    96000
+
+// The PLL's divisors for a SYS_MCLK of 8 to 27 MHz, for a part that is the
+// I2S master: `None` otherwise.
+fn pll_clock(mclk_hz: Int, sysfs: Int, mode: Int, master: Bool) -> ?SysClock
+    if not master or mclk_hz < 8000000 or mclk_hz > 27000000
+        return None
+    let div2 = mclk_hz > 17000000
+    var input = mclk_hz
+    if div2
+        input = mclk_hz / 2
+    var out = 196608000
+    if sysfs == 1
+        out = 180633600
+    Some(SysClock { sys_fs: sysfs, rate_mode: mode, mclk_freq: 3, pll: true, int_div: out / input,
+                    frac_div: out % input * 2048 / input, div2: div2 })
+
+// The clock for a rate from `mclk_hz`: the synchronous ratio when the clock
+// is 256, 384 or 512 times SYS_FS (256 only at 96 kHz), and the PLL
+// otherwise or when `force_pll` is set.  `None` for a rate the part has not,
+// and for a PLL clock outside 8 to 27 MHz or a part that is not the I2S
+// master.
+pub fn clock_plan(mclk_hz: Int, rate: Int, master: Bool, force_pll: Bool) -> ?SysClock
+    let sysfs = sys_fs_code(rate)
+    if sysfs < 0 or mclk_hz <= 0
+        return None
+    let mode = rate_mode_code(rate)
+    let hz = sys_fs_hz(sysfs)
+    if not force_pll
+        var ratio = -1
+        if mclk_hz == 256 * hz
+            ratio = 0
+        elif mclk_hz == 384 * hz and sysfs != 3
+            ratio = 1
+        elif mclk_hz == 512 * hz and sysfs != 3
+            ratio = 2
+        if ratio >= 0
+            return Some(SysClock { sys_fs: sysfs, rate_mode: mode, mclk_freq: ratio, pll: false,
+                                   int_div: 0, frac_div: 0, div2: false })
+    pll_clock(mclk_hz, sysfs, mode, master)
+
+// CLK_CTRL's value for a clock.
+pub fn clk_ctrl_of(k: SysClock) -> Int
+    (k.rate_mode << 4) | (k.sys_fs << 2) | k.mclk_freq
+
+// ── The serial port ──────────────────────────────────────────────────
+
+// CHIP_I2S_CTRL's value for a format: the bit clock of 32 or 64 times the
+// word clock, the role, the data length and the framing; -1 for a depth the
+// frame cannot carry.  16 bits are 32 clocks per frame, 32 bits are 64; 20
+// and 24 bits are in a slot of 32 and a frame of 64, which `I2sConfig` cannot
+// ask the handle for, so they are refused.
+pub fn i2s_ctrl_of(f: AudioFormat) -> Int
+    var v = 0
+    if f.bit_depth == 16
+        v = 0x0100 | (3 << 4)
+    elif f.bit_depth != 32
+        return -1
+    if f.codec_is_master
+        v = v | 0x0080
+    if f.framing == AudioFraming.AudioLeftJustified
+        v = v | 0x0002
+    v
+
+// The I2S settings for a format: the board drives the clocks unless the
+// codec does.
+pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
+    var role = I2sRole.I2sMaster
+    if f.codec_is_master
+        role = I2sRole.I2sSlave
+    var layout = I2sFormat.I2sPhilips
+    if f.framing == AudioFraming.AudioLeftJustified
+        layout = I2sFormat.I2sLeftJustified
+    I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
+                role: role, format: layout }
+
+// The clock for a format, or `None` when the codec cannot make it: a mono
+// format (the part frames two slots), a depth `i2s_ctrl_of` refuses, or a
+// rate and clock `clock_plan` refuses.
+pub fn plan_of(c: Sgtl5000Config, f: AudioFormat) -> ?SysClock
+    if not dev_audio.audio_format_valid(f) or f.channels != 2 or i2s_ctrl_of(f) < 0
+        return None
+    clock_plan(c.mclk_hz, f.sample_rate, f.codec_is_master, c.force_pll)
+
+// ── The named steps ──────────────────────────────────────────────────
+//
+// The sequences, one step per function, so that the order is the one place
+// to read and to test.
+
+// Step: quiet.  Everything is muted with the zero-cross detectors on, and a
+// VAG that an earlier run left powered is switched off and given the time to
+// ramp down, because writing ANA_POWER with it on and the outputs powered
+// pops even with the outputs muted.
+pub fn step_quiet<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    if not reg_write(p, ANA_CTRL, ANA_CTRL_MUTED)
+        return false
+    let Some(pw) = reg_read(p, ANA_POWER) else return false
+    if (pw & AP_VAG) == 0
+        return true
+    if not reg_write(p, ANA_POWER, pw & (0xFFFF ^ AP_VAG))
+        return false
+    p.pause_ms(VAG_DOWN_MS)
+    true
+
+// Step: the clock registers for a clock.  Synchronous: CLK_CTRL, then the
+// PLL powered down.  PLL: the divisors, INPUT_FREQ_DIV2, the PLL and the VCO
+// amplifier powered, a wait for the lock (up to 50 ms), and only then
+// CLK_CTRL selects the PLL.  False when the PLL does not lock.
+pub fn step_clock<P: Sgtl5000Port>(p: P, k: SysClock) -> Bool [hw]
+    if not k.pll
+        return reg_write(p, CLK_CTRL, clk_ctrl_of(k)) and reg_update(p, ANA_POWER, AP_PLL_BITS, 0)
+    var top = 0
+    if k.div2
+        top = 0x0008
+    if not reg_write(p, PLL_CTRL, (k.int_div << 11) | k.frac_div)
+        return false
+    if not reg_update(p, CLK_TOP_CTRL, 0x0008, top) or not reg_update(p, ANA_POWER, AP_PLL_BITS, AP_PLL_BITS)
+        return false
+    if not pll_wait(p)
+        return false
+    reg_write(p, CLK_CTRL, clk_ctrl_of(k))
+
+// Waits for CHIP_ANA_STATUS' PLL_IS_LOCKED, polling once a millisecond for up
+// to 50 of them: whether the PLL locked.
+pub fn pll_wait<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    for _i in 0..PLL_POLLS
+        let Some(s) = reg_read(p, ANA_STATUS) else return false
+        if (s & 0x0010) != 0
+            return true
+        p.pause_ms(1)
+    false
+
+// Step: the serial port, CHIP_I2S_CTRL written whole from the format.
+pub fn step_i2s<P: Sgtl5000Port>(p: P, f: AudioFormat) -> Bool [hw]
+    reg_write(p, I2S_CTRL, i2s_ctrl_of(f))
+
+// The end of the power-up, after the wait for the VAG ramp: the line-out
+// level, the routing, the DAC muted with its ramp on and at 0 dB, and the
+// headphone at its lowest volume.
+fn power_up_tail<P: Sgtl5000Port>(p: P, vag: Int, lo: Int) -> Bool [hw]
+    p.pause_ms(RAMP_UP_MS)
+    let q = lo_vol_code(800 + 25 * vag, 800 + 25 * lo)
+    reg_write(p, LINE_OUT_VOL, (q << 8) | q) and reg_write(p, SSS_CTRL, ROUTE_CODEC) and reg_write(p, ADCDAC_CTRL, DAC_RAMP_MUTED) and reg_write(p, DAC_VOL, DAC_VOL_0DB) and reg_write(p, ANA_HP_CTRL, HP_VOL_LOWEST)
+
+// Step: power up, the data sheet's sequence in its order for the supplies of
+// `c`.  The PLL bits of ANA_POWER and CLK_TOP_CTRL's divider bit a format has
+// already set are kept.  The outputs are muted throughout, the headphone
+// volume is at its lowest when the step ends, the DAC is muted with its ramp
+// on, and the routing is the codec's: I2S in to the DAC, ADC to I2S out.
+pub fn step_power_up<P: Sgtl5000Port>(p: P, c: Sgtl5000Config) -> Bool [hw]
+    let Some(cur) = reg_read(p, ANA_POWER) else return false
+    let keep = cur & AP_PLL_BITS
+    let high = supplies_high(c)
+    var ana = ANA_POWER_INT
+    if c.vddd_external
+        ana = ANA_POWER_EXT
+        if high and not reg_write(p, LINREG_CTRL, LINREG_VDDIO)
+            return false
+    else
+        var lin = LINREG_1V2
+        if high
+            lin = lin | LINREG_VDDIO
+        if not reg_write(p, LINREG_CTRL, lin)
+            return false
+    ana = ana | keep
+    if not reg_write(p, ANA_POWER, ana)
+        return false
+    if supplies_low(c)
+        ana = ana | AP_PUMP
+        if not reg_update(p, CLK_TOP_CTRL, CLK_TOP_OSC, CLK_TOP_OSC) or not reg_write(p, ANA_POWER, ana)
+            return false
+    let vag = vag_code(c.vdda_mv)
+    let lo = lo_code(c.vddio_mv)
+    let refv = (vag << 4) | (bias_code(c.vdda_mv) << 1)
+    var fin = (ana & (0xFFFF ^ AP_STARTUP)) | AP_BLOCKS
+    if not high
+        fin = fin | AP_PUMP
+    reg_write(p, REF_CTRL, refv) and reg_write(p, LINE_OUT_CTRL, LO_CURRENT | lo) and reg_write(p, REF_CTRL, refv | REF_SLOW_RAMP) and reg_write(p, SHORT_CTRL, SHORT_75MA) and reg_write(p, ANA_CTRL, ANA_CTRL_MUTED) and reg_write(p, ANA_POWER, fin) and reg_write(p, DIG_POWER, DIG_ALL) and power_up_tail(p, vag, lo)
+
+// Step: power down.  The outputs are muted, VAG is switched off and given the
+// time to ramp down with the headphone and line-out powered, then the
+// analogue blocks and the digital blocks are powered down.  The clock and
+// serial port registers are kept.
+pub fn step_power_down<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    if not mute_set(p, true)
+        return false
+    if not reg_update(p, ANA_POWER, AP_VAG, 0)
+        return false
+    p.pause_ms(VAG_DOWN_MS)
+    reg_update(p, ANA_POWER, AP_OUTPUTS, 0) and reg_write(p, DIG_POWER, 0)
+
+// Brings the part up: the bus ready, the chip ID read, and the part made
+// quiet.  SYS_MCLK has to be running already.  Answers whether the part
+// answered as an SGTL5000 and took every write.
+pub fn start<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    if not p.setup()
+        return false
+    if id_read(p) == None
+        return false
+    step_quiet(p)
+
+// ── Format, power, mute and gain ─────────────────────────────────────
+
+// Configures and enables the board's I2S handle for a format, so that
+// SYS_MCLK runs: whether the handle took it.  A program calls it before
+// `start`, because the part answers on I2C only while SYS_MCLK is present.
+pub fn i2s_start<S: I2s>(i2s: S, f: AudioFormat) -> Bool [hw]
+    if i2s_ctrl_of(f) < 0
+        return false
+    if not i2s.configure(i2s_config_of(f))
+        return false
+    i2s.enable()
+
+// Programs the codec for a format and configures and enables the board's I2S
+// handle for it: the clock found, the handle configured and enabled, then the
+// clock registers and the serial port.
+pub fn format_set<P: Sgtl5000Port, S: I2s>(p: P, i2s: S, c: Sgtl5000Config,
+                                           f: AudioFormat) -> Bool [hw]
+    let Some(k) = plan_of(c, f) else return false
+    if not i2s_start(i2s, f)
+        return false
+    step_clock(p, k) and step_i2s(p, f)
+
+// Powers the converters up or down.  Up is `step_power_up`: everything is
+// muted and stays muted until `codec_set_mute(false)`.  Down is
+// `step_power_down`, and the board's I2S handle is disabled after it.
+pub fn power_set<P: Sgtl5000Port, S: I2s>(p: P, i2s: S, c: Sgtl5000Config, on: Bool) -> Bool [hw]
+    if on
+        return step_power_up(p, c)
+    let ok = step_power_down(p)
+    i2s.disable()
+    ok
+
+// Waits for the DAC's volume ramp to end, polling the two busy bits every
+// 10 ms for up to 500 ms: whether it ended.
+pub fn ramp_wait<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    for _i in 0..POLLS
+        let Some(v) = reg_read(p, ADCDAC_CTRL) else return false
+        if (v & DAC_BUSY_BITS) == 0
+            return true
+        p.pause_ms(POLL_MS)
+    false
+
+// Mutes or unmutes the outputs.  Muting is the DAC's soft mute, a wait for
+// the ramp, and then the analogue mutes of the headphone and the line out.
+// Unmuting is the analogue unmutes and then the DAC's ramp up, so the output
+// rises from silence.  False when a write was refused or the ramp did not end
+// in 500 ms; the analogue mutes are set anyway.
+pub fn mute_set<P: Sgtl5000Port>(p: P, on: Bool) -> Bool [hw]
+    if on
+        if not reg_update(p, ADCDAC_CTRL, DAC_MUTE_BITS, DAC_MUTE_BITS)
+            return false
+        let ended = ramp_wait(p)
+        return reg_update(p, ANA_CTRL, HP_LO_MUTES, HP_LO_MUTES) and ended
+    reg_update(p, ANA_CTRL, HP_LO_MUTES, 0) and reg_update(p, ADCDAC_CTRL, DAC_MUTE_BITS, 0)
+
+// Whether the DAC is muted: both mute bits set; `None` when the part did not
+// answer.
+pub fn mute_get<P: Sgtl5000Port>(p: P) -> ?Bool [hw]
+    let Some(v) = reg_read(p, ADCDAC_CTRL) else return None
+    Some((v & DAC_MUTE_BITS) == DAC_MUTE_BITS)
+
+// The headphone volume code for a gain: +12 dB is code 0, 0 dB code 24 and
+// -51.5 dB code 127, in 0.5 dB steps; `None` below -51.5 dB, and +12 dB
+// above it.
+pub fn hp_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, HP_MIN_MDB, HP_MAX_MDB, HP_STEP_MDB)
+        Some(s) => Some((HP_MAX_MDB - s.mdb) / HP_STEP_MDB)
+        None    => None
+
+// The gain of a headphone volume code, in thousandths of a decibel.
+pub fn hp_mdb(code: Int) -> Int
+    HP_MAX_MDB - (code & 0x7F) * HP_STEP_MDB
+
+// The ADC volume as its two fields for a gain: `m6` is ADC_VOL_M6DB and
+// `code` the 1.5 dB steps of each channel.  A gain of 0 dB or more uses the
+// range from 0 to +22.5 dB; a gain below it uses the range shifted down by
+// 6 dB, -6 dB to +16.5 dB.
+pub @value
+struct AdcVolume
+    m6: Bool
+    code: Int
+
+// The fields for a gain, or `None` below -6 dB.  A gain above +22.5 dB is
+// +22.5 dB.
+pub fn adc_volume_of(g: MilliDb) -> ?AdcVolume
+    if g.mdb < ADC_LOW_MDB
+        return None
+    if g.mdb < 0
+        return Some(AdcVolume { m6: true, code: (g.mdb - ADC_LOW_MDB) / ADC_STEP_MDB })
+    var top = g.mdb
+    if top > ADC_MAX_MDB
+        top = ADC_MAX_MDB
+    Some(AdcVolume { m6: false, code: top / ADC_STEP_MDB })
+
+// The gain of the ADC volume fields, in thousandths of a decibel.
+pub fn adc_volume_mdb(v: AdcVolume) -> Int
+    var base = 0
+    if v.m6
+        base = ADC_LOW_MDB
+    base + v.code * ADC_STEP_MDB
+
+fn hp_gain_set<P: Sgtl5000Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = hp_code(g) else return None
+    if not reg_write(p, ANA_HP_CTRL, (code << 8) | code)
+        return None
+    Some(MilliDb { mdb: hp_mdb(code) })
+
+fn adc_gain_set<P: Sgtl5000Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(v) = adc_volume_of(g) else return None
+    var m6 = 0
+    if v.m6
+        m6 = 0x0100
+    if not reg_write(p, ANA_ADC_CTRL, m6 | (v.code << 4) | v.code)
+        return None
+    Some(MilliDb { mdb: adc_volume_mdb(v) })
+
+fn hp_gain_get<P: Sgtl5000Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, ANA_HP_CTRL) else return None
+    Some(MilliDb { mdb: hp_mdb(v & 0x7F) })
+
+fn adc_gain_get<P: Sgtl5000Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, ANA_ADC_CTRL) else return None
+    Some(MilliDb { mdb: adc_volume_mdb(AdcVolume { m6: (v & 0x0100) != 0, code: v & 0x0F }) })
+
+// Sets the headphone volume or the ADC volume to the largest step at or
+// below `g`: the gain set, or `None` when `g` is below the path's range or
+// the part did not take it.  The output gain is the headphone volume of both
+// channels, +12 to -51.5 dB; the line-out has its own reference-relative
+// level, `lineout_level_set`, and the DAC's digital volume is
+// `dac_volume_set`.  The input gain is the ADC volume of both channels,
+// -6 to +22.5 dB; the microphone amplifier is `mic_gain_set`.
+pub fn gain_set<P: Sgtl5000Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+    match path
+        CodecPath.CodecOutput => hp_gain_set(p, g)
+        CodecPath.CodecInput  => adc_gain_set(p, g)
+
+// The gain of a path as the part holds it, or `None` when it did not
+// answer.  The output gain is the left headphone volume, the input gain the
+// left ADC volume.
+pub fn gain_get<P: Sgtl5000Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
+    match path
+        CodecPath.CodecOutput => hp_gain_get(p)
+        CodecPath.CodecInput  => adc_gain_get(p)
+
+// ── Settings the trait has no place for ──────────────────────────────
+
+fn dac_volume_write<P: Sgtl5000Port>(p: P, code: Int, s: MilliDb) -> ?MilliDb [hw]
+    if not reg_write(p, DAC_VOL, (code << 8) | code)
+        return None
+    Some(s)
+
+// The DAC's digital volume, both channels: the largest step at or below `g`,
+// 0 dB to -90 dB in 0.5 dB steps, with the ramp of ADCDAC_CTRL.  A request
+// above 0 dB is 0 dB.  The gain set, or `None` below -90 dB or when the part
+// did not take it.
+pub fn dac_volume_set<P: Sgtl5000Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    match dev_audio.audio_gain_step(g, DAC_MIN_MDB, 0, DAC_STEP_MDB)
+        Some(s) => dac_volume_write(p, DAC_BASE_CODE - s.mdb / DAC_STEP_MDB, s)
+        None    => None
+
+// The DAC's digital volume as the part holds it (the left channel's), or
+// `None`.  A code above 0xF0 is read as -90 dB.
+pub fn dac_volume_get<P: Sgtl5000Port>(p: P) -> ?MilliDb [hw]
+    let Some(v) = reg_read(p, DAC_VOL) else return None
+    var code = v & 0xFF
+    if code < DAC_BASE_CODE
+        code = DAC_BASE_CODE
+    if code > 0xF0
+        code = 0xF0
+    Some(MilliDb { mdb: 0 - (code - DAC_BASE_CODE) * DAC_STEP_MDB })
+
+// Sets the DAC's volume ramp: whether a volume or mute change ramps
+// (VOL_RAMP_EN) and whether the ramp is exponential over the whole range and
+// not linear over the top four octaves (VOL_EXPO_RAMP).
+pub fn ramp_set<P: Sgtl5000Port>(p: P, on: Bool, expo: Bool) -> Bool [hw]
+    var flags = 0
+    if on
+        flags = 0x0200
+    if expo
+        flags = flags | 0x0100
+    reg_update(p, ADCDAC_CTRL, 0x0300, flags)
+
+// The line-out level code, 0 to 31, 0.5 dB steps: the level that is full scale
+// follows `lo_vol_code` for the supplies in use.  False above 31.
+pub fn lineout_level_set<P: Sgtl5000Port>(p: P, code: Int) -> Bool [hw]
+    if code < 0 or code > 31
+        return false
+    reg_write(p, LINE_OUT_VOL, (code << 8) | code)
+
+// The signal the audio switch gives the DAC and the I2S output: the codec's
+// (I2S in to the DAC, ADC to I2S out), the ADC to both, or I2S in to both.
+pub @value
+enum Route
+    RouteCodec
+    RouteAdcToDac
+    RouteI2sThrough
+
+// Writes CHIP_SSS_CTRL for a route.  Its I2S_SELECT field is write-only, so
+// the register is written whole.
+pub fn route_set<P: Sgtl5000Port>(p: P, r: Route) -> Bool [hw]
+    match r
+        Route.RouteCodec      => reg_write(p, SSS_CTRL, ROUTE_CODEC)
+        Route.RouteAdcToDac   => reg_write(p, SSS_CTRL, 0x0000)
+        Route.RouteI2sThrough => reg_write(p, SSS_CTRL, 0x0011)
+
+// Selects the ADC's input: the microphone (`true`) or the line input.
+pub fn mic_input_set<P: Sgtl5000Port>(p: P, mic: Bool) -> Bool [hw]
+    var flags = 0x0004
+    if mic
+        flags = 0
+    reg_update(p, ANA_CTRL, 0x0004, flags)
+
+// Selects the headphone's input: the DAC (`false`) or the line input, the
+// analogue bypass that skips the converters.
+pub fn hp_bypass_set<P: Sgtl5000Port>(p: P, line: Bool) -> Bool [hw]
+    var flags = 0
+    if line
+        flags = 0x0040
+    reg_update(p, ANA_CTRL, 0x0040, flags)
+
+// Enables the zero-cross detectors of the headphone volume (`hp`) and of the
+// ADC volume (`adc`).
+pub fn zero_cross_set<P: Sgtl5000Port>(p: P, hp: Bool, adc: Bool) -> Bool [hw]
+    var flags = 0
+    if hp
+        flags = flags | 0x0020
+    if adc
+        flags = flags | 0x0002
+    reg_update(p, ANA_CTRL, 0x0022, flags)
+
+// The microphone amplifier's gain code for a request: 0, 20, 30 or 40 dB, the
+// largest at or below it; `None` below 0 dB.
+pub fn mic_gain_code(g: MilliDb) -> ?Int
+    if g.mdb < 0
+        return None
+    if g.mdb >= 40000
+        return Some(3)
+    if g.mdb >= 30000
+        return Some(2)
+    if g.mdb >= 20000
+        return Some(1)
+    Some(0)
+
+// The gain of a microphone amplifier code.
+pub fn mic_gain_mdb(code: Int) -> Int
+    if code == 0
+        return 0
+    if code == 1
+        return 20000
+    if code == 2
+        return 30000
+    40000
+
+// Sets the microphone amplifier: the gain set, or `None` below 0 dB or when
+// the part did not take it.
+pub fn mic_gain_set<P: Sgtl5000Port>(p: P, g: MilliDb) -> ?MilliDb [hw]
+    let Some(code) = mic_gain_code(g) else return None
+    if not reg_update(p, MIC_CTRL, 0x0003, code)
+        return None
+    Some(MilliDb { mdb: mic_gain_mdb(code) })
+
+// Sets the microphone bias: the output resistance, 0 for off or 2000, 4000 or
+// 8000 ohms, and the voltage from 1250 to 3000 mV in 250 mV steps, which the
+// data sheet asks to keep 200 mV below VDDA.  False for a value the part has
+// not.
+pub fn mic_bias_set<P: Sgtl5000Port>(p: P, ohms: Int, mv: Int) -> Bool [hw]
+    var r = 0
+    if ohms == 2000
+        r = 1
+    elif ohms == 4000
+        r = 2
+    elif ohms == 8000
+        r = 3
+    elif ohms != 0
+        return false
+    if mv < 1250 or mv > 3000 or (mv - 1250) % 250 != 0
+        return false
+    reg_update(p, MIC_CTRL, 0x0370, (r << 8) | (((mv - 1250) / 250) << 4))
+
+// Puts the serial port in the right-justified format: the 64 clock frame, as
+// 32 clocks are not supported with it.
+pub fn rj_format_set<P: Sgtl5000Port>(p: P) -> Bool [hw]
+    reg_update(p, I2S_CTRL, 0x010E, 0x0004)
+
+// Puts the serial port in PCM mode, A (`b` false) or B (`b` true).
+pub fn pcm_format_set<P: Sgtl5000Port>(p: P, b: Bool) -> Bool [hw]
+    var flags = 0x0008
+    if b
+        flags = flags | 0x0002
+    reg_update(p, I2S_CTRL, 0x000E, flags)
+
+// Whether the PLL is locked; `None` when the part did not answer.
+pub fn pll_locked<P: Sgtl5000Port>(p: P) -> ?Bool [hw]
+    let Some(s) = reg_read(p, ANA_STATUS) else return None
+    Some((s & 0x0010) != 0)
+
+// Whether a headphone short detector has tripped (the left or right driver or
+// the capless centre); `None` when the part did not answer.
+pub fn short_detected<P: Sgtl5000Port>(p: P) -> ?Bool [hw]
+    let Some(s) = reg_read(p, ANA_STATUS) else return None
+    Some((s & 0x0300) != 0)
+
+// ── The codec on a board's I2C bus and I2S handle ────────────────────
+
+// An SGTL5000 on a board's I2C bus at the address `w.addr`, 0x0A or 0x2A by
+// the CTRL_ADR0_CS pin, and the board's I2S handle that carries its samples.
+pub struct Sgtl5000<S: I2s>
+    bus: BoardI2c
+    w: DeviceWiring
+    i2s: S
+    cfg: Sgtl5000Config
+
+// The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
+// for its samples.  Nothing is sent.  A struct with a generic field cannot
+// be a `@value`, so the codec is one cell of the arena, built in a `system`
+// block, the one allocation of the package.
+pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Sgtl5000Config) -> Sgtl5000<S>
+    system
+        return Sgtl5000 { bus: bus, w: w, i2s: i2s, cfg: cfg }
+
+impl Sgtl5000Port for Sgtl5000
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn read_word(self, reg: Int) -> ?Int [hw]
+        i2c_read_word(self.bus, self.w, reg)
+
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write_word(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        BoardTimer { id: 0 }.delay_ms(ms)
+
+impl Sgtl5000
+    // Starts the I2S handle for a format so that SYS_MCLK runs
+    // (`i2s_start`).  A program calls it before `begin`.
+    fn start_clock(self, f: AudioFormat) -> Bool [hw]
+        i2s_start(self.i2s, f)
+
+    // Brings the part up (`start`): the chip ID and a quiet part.  SYS_MCLK
+    // has to be running, and the caller has powered the part.
+    fn begin(self) -> Bool [hw]
+        start(self)
+
+    // One register, `None` when the part did not answer, and a write.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The DAC's digital volume, its ramp and the line-out level.
+    fn set_dac_volume(self, g: MilliDb) -> ?MilliDb [hw]
+        dac_volume_set(self, g)
+
+    fn dac_volume(self) -> ?MilliDb [hw]
+        dac_volume_get(self)
+
+    fn set_ramp(self, on: Bool, expo: Bool) -> Bool [hw]
+        ramp_set(self, on, expo)
+
+    fn set_lineout_level(self, code: Int) -> Bool [hw]
+        lineout_level_set(self, code)
+
+    // The routing, the inputs and the zero-cross detectors.
+    fn set_route(self, r: Route) -> Bool [hw]
+        route_set(self, r)
+
+    fn set_mic_input(self, mic: Bool) -> Bool [hw]
+        mic_input_set(self, mic)
+
+    fn set_hp_bypass(self, line: Bool) -> Bool [hw]
+        hp_bypass_set(self, line)
+
+    fn set_zero_cross(self, hp: Bool, adc: Bool) -> Bool [hw]
+        zero_cross_set(self, hp, adc)
+
+    // The microphone amplifier and bias.
+    fn set_mic_gain(self, g: MilliDb) -> ?MilliDb [hw]
+        mic_gain_set(self, g)
+
+    fn set_mic_bias(self, ohms: Int, mv: Int) -> Bool [hw]
+        mic_bias_set(self, ohms, mv)
+
+    // The right-justified and PCM formats, and the status bits.
+    fn set_rj_format(self) -> Bool [hw]
+        rj_format_set(self)
+
+    fn set_pcm_format(self, b: Bool) -> Bool [hw]
+        pcm_format_set(self, b)
+
+    fn locked(self) -> ?Bool [hw]
+        pll_locked(self)
+
+    fn shorted(self) -> ?Bool [hw]
+        short_detected(self)
+
+    // Stops the I2S handle's clocks without powering the codec down.
+    fn i2s_stop(self) [hw]
+        self.i2s.disable()
+
+impl AudioCodec[hw] for Sgtl5000
+    fn codec_set_format(self, f: AudioFormat) -> Bool [hw]
+        format_set(self, self.i2s, self.cfg, f)
+
+    fn codec_set_power(self, on: Bool) -> Bool [hw]
+        power_set(self, self.i2s, self.cfg, on)
+
+    fn codec_set_mute(self, on: Bool) -> Bool [hw]
+        mute_set(self, on)
+
+    fn codec_is_muted(self) -> ?Bool [hw]
+        mute_get(self)
+
+    fn codec_set_gain(self, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
+        gain_set(self, path, g)
+
+    fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw]
+        gain_get(self, path)
+
+impl Identifiable[hw] for Sgtl5000
+    // PARTID, 0xA0, as `who`, and REVID as `rev`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

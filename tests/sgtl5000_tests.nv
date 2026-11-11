@@ -1,0 +1,1119 @@
+// sgtl5000_tests — the driver over a double of the part: a file of 16-bit
+// registers behind an I2C bus with 16-bit register addresses, starting from
+// the data sheet's reset values, and a double of the board's I2S handle.  The
+// log keeps every transaction in a form the tests compare, so the order of the
+// steps, which the data sheet fixes, is pinned register by register.
+//
+// Log entries: a write of `v` to register `r` is `16777216 + r * 65536 + v`; a
+// read of one register is `33554432 + r * 65536 + 2`; a pause of `ms`
+// milliseconds is `50331648 + ms`.  The helpers `lw`, `lr` and `lp` build
+// them.
+//
+// The chip's state, in `st`: 0 is 1 when a part is there, 1 the writes seen,
+// 2 the write number from which every write is refused (0 for none), 4 the
+// I2C clock set, 5 a register whose read is refused plus one (0 for none),
+// 6 the pauses seen, 9 the entries in the log, 10 the reads of CHIP_ADCDAC_CTRL
+// that still show the volume ramp busy, 11 the reads of CHIP_ANA_STATUS that
+// still show the PLL unlocked, 12 1 when a read answers one byte.
+//
+// The I2S double's state, in `ist`: 0 configure calls, 1 sample rate, 2 bit
+// depth, 3 channels, 4 role (0 master, 1 slave), 5 format (0 Philips, 1
+// left-justified), 6 enabled, 8 refuse configure, 10 disable calls, 13
+// refuse enable.
+
+use std.test
+use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_id.{ DeviceId, Identifiable }
+use sgtl5000
+use sgtl5000.{ Sgtl5000Port, Sgtl5000Config, SysClock, AdcVolume, Route }
+
+// ── The doubles ──────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The reset values of the data sheet's tables.
+fn load_defaults(c: Chip)
+    c.regs.insert(0x0000, 0xA011)
+    c.regs.insert(0x0002, 0x0000)
+    c.regs.insert(0x0004, 0x0008)
+    c.regs.insert(0x0006, 0x0010)
+    c.regs.insert(0x000A, 0x0010)
+    c.regs.insert(0x000E, 0x020C)
+    c.regs.insert(0x0010, 0x3C3C)
+    c.regs.insert(0x0020, 0x0000)
+    c.regs.insert(0x0022, 0x1818)
+    c.regs.insert(0x0024, 0x0111)
+    c.regs.insert(0x0026, 0x0000)
+    c.regs.insert(0x0028, 0x0000)
+    c.regs.insert(0x002A, 0x0000)
+    c.regs.insert(0x002C, 0x0000)
+    c.regs.insert(0x002E, 0x0404)
+    c.regs.insert(0x0030, 0x7060)
+    c.regs.insert(0x0032, 0x5000)
+    c.regs.insert(0x0034, 0x0000)
+    c.regs.insert(0x0036, 0x0000)
+    c.regs.insert(0x003C, 0x0000)
+
+// A part at its reset values.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    load_defaults(c)
+    c.st.insert(0, 1)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 9)
+    c.log.insert(n, v)
+    c.st.insert(9, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(9, 0)
+
+fn lw(r: Int, v: Int) -> Int
+    16777216 + r * 65536 + v
+
+fn lr(r: Int) -> Int
+    33554432 + r * 65536 + 2
+
+fn lp(ms: Int) -> Int
+    50331648 + ms
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 9), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(4, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if data.len() != 4
+            return false
+        let reg = data[0] as Int * 256 + data[1] as Int
+        let v = data[2] as Int * 256 + data[3] as Int
+        log_push(self.c, lw(reg, v))
+        let n = at(self.c.st, 1) + 1
+        self.c.st.insert(1, n)
+        if addr != 0x0A or at(self.c.st, 0) == 0
+            return false
+        let from = at(self.c.st, 2)
+        if from > 0 and n >= from
+            return false
+        if reg == 0x000E
+            self.c.regs.insert(reg, v & 0xCFFF)
+            return true
+        self.c.regs.insert(reg, v)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if tx.len() != 2
+            return None
+        let reg = tx[0] as Int * 256 + tx[1] as Int
+        log_push(self.c, 33554432 + reg * 65536 + n)
+        if addr != 0x0A or at(self.c.st, 0) == 0
+            return None
+        if reg + 1 == at(self.c.st, 5)
+            return None
+        var v = at(self.c.regs, reg)
+        if reg == 0x000E and at(self.c.st, 10) > 0
+            self.c.st.insert(10, at(self.c.st, 10) - 1)
+            v = v | 0x3000
+        if reg == 0x0036 and at(self.c.st, 11) > 0
+            self.c.st.insert(11, at(self.c.st, 11) - 1)
+        elif reg == 0x0036
+            v = v | 0x0010
+        var out: [u8] = []
+        if at(self.c.st, 12) == 1
+            list.push(out, (v / 256) as u8)
+            return Some(out)
+        list.push(out, (v / 256) as u8)
+        list.push(out, (v % 256) as u8)
+        Some(out)
+
+// The port: the package's own functions over the double, and a pause that
+// is logged and not waited.
+struct Dut
+    bus: FakeI2c
+    w: DeviceWiring
+
+impl Sgtl5000Port for Dut
+    fn setup(self) -> Bool [hw]
+        sgtl5000.i2c_setup(self.bus, self.w)
+
+    fn read_word(self, reg: Int) -> ?Int [hw]
+        sgtl5000.i2c_read_word(self.bus, self.w, reg)
+
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+        sgtl5000.i2c_write_word(self.bus, self.w, reg, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        log_push(self.bus.c, lp(ms))
+        self.bus.c.st.insert(6, at(self.bus.c.st, 6) + 1)
+
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, w: dev_bus.wiring_i2c(0, 0x0A) }
+
+struct Link
+    st: HashMap<Int, Int>
+
+fn link() -> Link
+    Link { st: HashMap.new() }
+
+impl I2s for Link
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        self.st.insert(0, at(self.st, 0) + 1)
+        if at(self.st, 8) == 1
+            return false
+        self.st.insert(1, c.sample_rate)
+        self.st.insert(2, c.bit_depth)
+        self.st.insert(3, c.channels)
+        if c.role == I2sRole.I2sMaster
+            self.st.insert(4, 0)
+        else
+            self.st.insert(4, 1)
+        if c.format == I2sFormat.I2sPhilips
+            self.st.insert(5, 0)
+        else
+            self.st.insert(5, 1)
+        true
+
+    fn sample_rate(self) -> Int [hw]
+        at(self.st, 1)
+
+    fn enable(self) -> Bool [hw]
+        if at(self.st, 13) == 1
+            return false
+        self.st.insert(6, 1)
+        true
+
+    fn disable(self) [hw]
+        self.st.insert(6, 0)
+        self.st.insert(10, at(self.st, 10) + 1)
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
+                  codec_is_master: master }
+
+fn cfg_of(mclk: Int, vdda: Int, vddio: Int, ext: Bool) -> Sgtl5000Config
+    Sgtl5000Config { mclk_hz: mclk, vdda_mv: vdda, vddio_mv: vddio, vddd_external: ext,
+                     force_pll: false }
+
+fn db(m: Int) -> MilliDb
+    MilliDb { mdb: m }
+
+// ── The bus framing ──────────────────────────────────────────────────
+
+@test
+fn test_a_write_is_the_16_bit_address_then_the_16_bit_value_in_one_transaction() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.write_word(0x0010, 0x3C3C))
+    test.assert_eq(reg_of(c, 0x0010), 0x3C3C)
+    test.assert(sgtl5000.reg_write(d, 0x0022, 0x11234))
+    test.assert_eq(reg_of(c, 0x0022), 0x1234)
+    log_is(c, [lw(0x0010, 0x3C3C), lw(0x0022, 0x1234)])
+
+@test
+fn test_a_read_is_the_address_a_repeated_start_and_two_bytes_high_first() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0010, 0x1234)
+    let d = dut(c)
+    test.assert(sgtl5000.reg_read(d, 0x0010) == Some(0x1234))
+    log_is(c, [lr(0x0010)])
+    c.st.insert(5, 0x0010 + 1)
+    test.assert(sgtl5000.reg_read(d, 0x0010) == None)
+    c.st.insert(5, 0)
+    c.st.insert(12, 1)
+    test.assert(sgtl5000.reg_read(d, 0x0010) == None)
+
+@test
+fn test_setup_sets_the_bus_to_400_khz_and_needs_an_address() [io, hw]
+    let c = chip()
+    test.assert(dut(c).setup())
+    test.assert_eq(at(c.st, 4), 400000)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not Dut { bus: FakeI2c { c: c }, w: w }.setup())
+
+@test
+fn test_a_part_that_is_not_there_refuses_every_transaction() [io, hw]
+    let c = chip()
+    c.st.insert(0, 0)
+    let d = dut(c)
+    test.assert(not d.write_word(0x0010, 1))
+    test.assert(sgtl5000.reg_read(d, 0x0010) == None)
+    test.assert(not sgtl5000.reg_update(d, 0x0010, 0xFFFF, 1))
+    test.assert(sgtl5000.id_read(d) == None)
+
+@test
+fn test_an_update_keeps_the_bits_outside_the_mask() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0024, 0x5A5A)
+    let d = dut(c)
+    test.assert(sgtl5000.reg_update(d, 0x0024, 0x00FF, 0x0003))
+    test.assert_eq(reg_of(c, 0x0024), 0x5A03)
+    log_is(c, [lr(0x0024), lw(0x0024, 0x5A03)])
+    c.st.insert(5, 0x0024 + 1)
+    test.assert(not sgtl5000.reg_update(d, 0x0024, 0x00FF, 0x0003))
+
+@test
+fn test_the_address_follows_the_cs_pin() [io]
+    test.assert_eq(sgtl5000.address_of(false), 0x0A)
+    test.assert_eq(sgtl5000.address_of(true), 0x2A)
+
+// ── Identity and the start ───────────────────────────────────────────
+
+@test
+fn test_the_chip_id_is_partid_a0_and_the_low_byte_is_the_revision() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    match sgtl5000.id_read(d)
+        Some(id) =>
+            test.assert_eq(id.who, 0xA0)
+            test.assert(id.rev == Some(0x11))
+        None     => test.assert(false)
+    log_is(c, [lr(0x0000)])
+    c.regs.insert(0x0000, 0xA100)
+    test.assert(sgtl5000.id_read(d) == None)
+
+@test
+fn test_the_start_reads_the_id_and_quiets_the_part() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.start(d))
+    log_is(c, [lr(0x0000), lw(0x0024, 0x0133), lr(0x0030)])
+    test.assert_eq(at(c.st, 4), 400000)
+
+@test
+fn test_the_start_refuses_a_part_that_does_not_answer_or_is_another() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not sgtl5000.start(Dut { bus: FakeI2c { c: c }, w: w }))
+    log_is(c, [])
+    c.regs.insert(0x0000, 0x1234)
+    test.assert(not sgtl5000.start(dut(c)))
+    log_is(c, [lr(0x0000)])
+
+@test
+fn test_quiet_mutes_and_switches_off_a_vag_left_on_and_waits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0030, 0x72FF)
+    test.assert(sgtl5000.step_quiet(d))
+    log_is(c, [lw(0x0024, 0x0133), lr(0x0030), lw(0x0030, 0x727F), lp(500)])
+    test.assert_eq(reg_of(c, 0x0030), 0x727F)
+
+@test
+fn test_every_refusal_in_the_quiet_step_is_reported() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not sgtl5000.step_quiet(dut(c)))
+    let c2 = chip()
+    c2.st.insert(5, 0x0030 + 1)
+    test.assert(not sgtl5000.step_quiet(dut(c2)))
+    let c3 = chip()
+    c3.regs.insert(0x0030, 0x72FF)
+    c3.st.insert(2, 2)
+    test.assert(not sgtl5000.step_quiet(dut(c3)))
+
+// ── The supplies ─────────────────────────────────────────────────────
+
+@test
+fn test_vag_and_the_line_out_reference_follow_half_the_supply() [io]
+    test.assert_eq(sgtl5000.vag_code(1800), 4)
+    test.assert_eq(sgtl5000.vag_code(3300), 31)
+    test.assert_eq(sgtl5000.vag_code(1000), 0)
+    test.assert_eq(sgtl5000.lo_code(3300), 34)
+    test.assert_eq(sgtl5000.lo_code(1800), 4)
+    test.assert_eq(sgtl5000.lo_code(3600), 35)
+    test.assert_eq(sgtl5000.lo_code(1000), 0)
+    test.assert_eq(sgtl5000.bias_code(1800), 7)
+    test.assert_eq(sgtl5000.bias_code(3300), 0)
+
+@test
+fn test_the_line_out_level_is_table_32_and_the_examples_5() [io]
+    test.assert_eq(sgtl5000.lo_vol_code(900, 1650), 5)
+    test.assert_eq(sgtl5000.lo_vol_code(900, 1550), 6)
+    test.assert_eq(sgtl5000.lo_vol_code(900, 900), 15)
+    test.assert_eq(sgtl5000.lo_vol_code(1550, 900), 25)
+    test.assert_eq(sgtl5000.lo_vol_code(1550, 1550), 15)
+    test.assert_eq(sgtl5000.lo_vol_code(1000, 0), 15)
+    test.assert_eq(sgtl5000.lo_vol_code(3000, 800), 31)
+
+@test
+fn test_the_supply_classes() [io]
+    test.assert(sgtl5000.supplies_high(cfg_of(0, 3300, 3300, false)))
+    test.assert(not sgtl5000.supplies_high(cfg_of(0, 1800, 3300, false)))
+    test.assert(sgtl5000.supplies_low(cfg_of(0, 1800, 1800, false)))
+    test.assert(not sgtl5000.supplies_low(cfg_of(0, 1800, 3300, false)))
+    let d = sgtl5000.config_default(12288000)
+    test.assert_eq(d.vdda_mv, 3300)
+    test.assert(not d.vddd_external)
+    test.assert(not d.force_pll)
+
+// ── The clock ────────────────────────────────────────────────────────
+
+fn clock_is(p: ?SysClock, fs: Int, mode: Int, freq: Int)
+    match p
+        Some(x) =>
+            test.assert_eq(x.sys_fs, fs)
+            test.assert_eq(x.rate_mode, mode)
+            test.assert_eq(x.mclk_freq, freq)
+            test.assert(not x.pll)
+        None    => test.assert(false)
+
+fn pll_is(p: ?SysClock, fs: Int, int_div: Int, frac: Int, div2: Bool)
+    match p
+        Some(x) =>
+            test.assert_eq(x.sys_fs, fs)
+            test.assert_eq(x.mclk_freq, 3)
+            test.assert(x.pll)
+            test.assert_eq(x.int_div, int_div)
+            test.assert_eq(x.frac_div, frac)
+            test.assert(x.div2 == div2)
+        None    => test.assert(false)
+
+@test
+fn test_the_rate_codes() [io]
+    test.assert_eq(sgtl5000.sys_fs_code(32000), 0)
+    test.assert_eq(sgtl5000.sys_fs_code(16000), 0)
+    test.assert_eq(sgtl5000.sys_fs_code(8000), 0)
+    test.assert_eq(sgtl5000.sys_fs_code(44100), 1)
+    test.assert_eq(sgtl5000.sys_fs_code(22050), 1)
+    test.assert_eq(sgtl5000.sys_fs_code(11025), 1)
+    test.assert_eq(sgtl5000.sys_fs_code(48000), 2)
+    test.assert_eq(sgtl5000.sys_fs_code(24000), 2)
+    test.assert_eq(sgtl5000.sys_fs_code(12000), 2)
+    test.assert_eq(sgtl5000.sys_fs_code(96000), 3)
+    test.assert_eq(sgtl5000.sys_fs_code(88200), -1)
+    test.assert_eq(sgtl5000.rate_mode_code(48000), 0)
+    test.assert_eq(sgtl5000.rate_mode_code(24000), 1)
+    test.assert_eq(sgtl5000.rate_mode_code(16000), 1)
+    test.assert_eq(sgtl5000.rate_mode_code(22050), 1)
+    test.assert_eq(sgtl5000.rate_mode_code(12000), 2)
+    test.assert_eq(sgtl5000.rate_mode_code(8000), 2)
+    test.assert_eq(sgtl5000.rate_mode_code(11025), 2)
+    test.assert_eq(sgtl5000.sys_fs_hz(0), 32000)
+    test.assert_eq(sgtl5000.sys_fs_hz(1), 44100)
+    test.assert_eq(sgtl5000.sys_fs_hz(2), 48000)
+    test.assert_eq(sgtl5000.sys_fs_hz(3), 96000)
+
+@test
+fn test_the_synchronous_clocks_are_256_384_and_512_times_sys_fs() [io]
+    clock_is(sgtl5000.clock_plan(12288000, 48000, false, false), 2, 0, 0)
+    clock_is(sgtl5000.clock_plan(11289600, 44100, false, false), 1, 0, 0)
+    clock_is(sgtl5000.clock_plan(18432000, 48000, false, false), 2, 0, 1)
+    clock_is(sgtl5000.clock_plan(24576000, 48000, false, false), 2, 0, 2)
+    clock_is(sgtl5000.clock_plan(24576000, 96000, false, false), 3, 0, 0)
+    clock_is(sgtl5000.clock_plan(8192000, 16000, false, false), 0, 1, 0)
+    clock_is(sgtl5000.clock_plan(8192000, 8000, false, false), 0, 2, 0)
+    clock_is(sgtl5000.clock_plan(11289600, 22050, false, false), 1, 1, 0)
+    clock_is(sgtl5000.clock_plan(12288000, 12000, false, false), 2, 2, 0)
+
+@test
+fn test_the_rate_modes_keep_the_ratio_relative_to_sys_fs() [io]
+    test.assert(sgtl5000.clock_plan(4096000, 16000, false, false) == None)
+    test.assert(sgtl5000.clock_plan(4096000, 16000, true, false) == None)
+
+@test
+fn test_the_pll_for_12_mhz_at_48_khz_is_16_and_786() [io]
+    pll_is(sgtl5000.clock_plan(12000000, 48000, true, false), 2, 16, 786, false)
+    pll_is(sgtl5000.clock_plan(12000000, 44100, true, false), 1, 15, 108, false)
+    pll_is(sgtl5000.clock_plan(26000000, 48000, true, false), 2, 15, 253, true)
+
+@test
+fn test_the_pll_needs_the_part_as_master_and_a_clock_of_8_to_27_mhz() [io]
+    test.assert(sgtl5000.clock_plan(12000000, 48000, false, false) == None)
+    test.assert(sgtl5000.clock_plan(7999999, 48000, true, false) == None)
+    test.assert(sgtl5000.clock_plan(27000001, 48000, true, false) == None)
+    test.assert(sgtl5000.clock_plan(27000000, 48000, true, false) != None)
+    test.assert(sgtl5000.clock_plan(36864000, 96000, true, false) == None)
+
+@test
+fn test_a_forced_pll_takes_the_synchronous_clock_too() [io]
+    pll_is(sgtl5000.clock_plan(12288000, 48000, true, true), 2, 16, 0, false)
+    test.assert(sgtl5000.clock_plan(12288000, 48000, false, true) == None)
+
+@test
+fn test_no_rate_or_clock_has_no_plan() [io]
+    test.assert(sgtl5000.clock_plan(12288000, 44000, true, false) == None)
+    test.assert(sgtl5000.clock_plan(0, 48000, true, false) == None)
+    test.assert(sgtl5000.clock_plan(-1, 48000, true, false) == None)
+
+@test
+fn test_clk_ctrl_packs_rate_mode_sys_fs_and_the_ratio() [io]
+    match sgtl5000.clock_plan(12288000, 48000, false, false)
+        Some(k) => test.assert_eq(sgtl5000.clk_ctrl_of(k), 0x0008)
+        None    => test.assert(false)
+    match sgtl5000.clock_plan(8192000, 16000, false, false)
+        Some(k) => test.assert_eq(sgtl5000.clk_ctrl_of(k), 0x0010)
+        None    => test.assert(false)
+    match sgtl5000.clock_plan(12000000, 48000, true, false)
+        Some(k) => test.assert_eq(sgtl5000.clk_ctrl_of(k), 0x000B)
+        None    => test.assert(false)
+    match sgtl5000.clock_plan(12288000, 8000, false, false)
+        Some(k) => test.assert_eq(sgtl5000.clk_ctrl_of(k), 0x0021)
+        None    => test.assert(false)
+
+// ── The serial port ──────────────────────────────────────────────────
+
+@test
+fn test_i2s_ctrl_packs_the_clock_the_role_the_length_and_the_framing() [io]
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)), 0x0130)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, true)), 0x01B0)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, true)), 0x0082)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)), 0x0000)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)), -1)
+
+@test
+fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
+    let a = sgtl5000.i2s_config_of(fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false))
+    test.assert(a.role == I2sRole.I2sMaster)
+    test.assert(a.format == I2sFormat.I2sPhilips)
+    let b = sgtl5000.i2s_config_of(fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, true))
+    test.assert(b.role == I2sRole.I2sSlave)
+    test.assert(b.format == I2sFormat.I2sLeftJustified)
+
+@test
+fn test_the_plan_for_a_format_refuses_what_the_part_cannot_frame() [io]
+    let c = cfg_of(12288000, 3300, 3300, false)
+    clock_is(sgtl5000.plan_of(c, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)), 2, 0, 0)
+    test.assert(sgtl5000.plan_of(c, fmt_of(48000, 16, 1, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(sgtl5000.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(sgtl5000.plan_of(c, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(sgtl5000.plan_of(c, fmt_of(0, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+
+// ── The named steps ──────────────────────────────────────────────────
+
+@test
+fn test_the_power_up_of_the_data_sheets_example_is_byte_for_byte() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.step_power_up(d, cfg_of(12288000, 1800, 3300, false)))
+    log_is(c, [lr(0x0030),
+        lw(0x0026, 0x0008),
+        lw(0x0030, 0x7260),
+        lw(0x0028, 0x004E),
+        lw(0x002C, 0x0322),
+        lw(0x0028, 0x004F),
+        lw(0x003C, 0x1106),
+        lw(0x0024, 0x0133),
+        lw(0x0030, 0x6AFF),
+        lw(0x0002, 0x0073),
+        lp(400),
+        lw(0x002E, 0x0505),
+        lw(0x000A, 0x0010),
+        lw(0x000E, 0x020C),
+        lw(0x0010, 0x3C3C),
+        lw(0x0022, 0x7F7F)])
+
+@test
+fn test_the_power_up_with_both_supplies_at_3_3_v_uses_the_vddio_charge_pump() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.step_power_up(d, sgtl5000.config_default(12288000)))
+    log_is(c, [lr(0x0030),
+        lw(0x0026, 0x0068),
+        lw(0x0030, 0x7260),
+        lw(0x0028, 0x01F0),
+        lw(0x002C, 0x0322),
+        lw(0x0028, 0x01F1),
+        lw(0x003C, 0x1106),
+        lw(0x0024, 0x0133),
+        lw(0x0030, 0x62FF),
+        lw(0x0002, 0x0073),
+        lp(400),
+        lw(0x002E, 0x0F0F),
+        lw(0x000A, 0x0010),
+        lw(0x000E, 0x020C),
+        lw(0x0010, 0x3C3C),
+        lw(0x0022, 0x7F7F)])
+
+@test
+fn test_the_power_up_with_an_external_vddd_clears_the_startup_bits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.step_power_up(d, cfg_of(12288000, 3300, 3300, true)))
+    log_is(c, [lr(0x0030),
+        lw(0x0026, 0x0060),
+        lw(0x0030, 0x4060),
+        lw(0x0028, 0x01F0),
+        lw(0x002C, 0x0322),
+        lw(0x0028, 0x01F1),
+        lw(0x003C, 0x1106),
+        lw(0x0024, 0x0133),
+        lw(0x0030, 0x40FF),
+        lw(0x0002, 0x0073),
+        lp(400),
+        lw(0x002E, 0x0F0F),
+        lw(0x000A, 0x0010),
+        lw(0x000E, 0x020C),
+        lw(0x0010, 0x3C3C),
+        lw(0x0022, 0x7F7F)])
+
+@test
+fn test_the_power_up_with_both_supplies_below_3_1_v_enables_the_oscillator_and_the_pump() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.step_power_up(d, cfg_of(12288000, 1800, 1800, false)))
+    log_is(c, [lr(0x0030),
+        lw(0x0026, 0x0008),
+        lw(0x0030, 0x7260),
+        lr(0x0034), lw(0x0034, 0x0800),
+        lw(0x0030, 0x7A60),
+        lw(0x0028, 0x004E),
+        lw(0x002C, 0x0304),
+        lw(0x0028, 0x004F),
+        lw(0x003C, 0x1106),
+        lw(0x0024, 0x0133),
+        lw(0x0030, 0x6AFF),
+        lw(0x0002, 0x0073),
+        lp(400),
+        lw(0x002E, 0x0F0F),
+        lw(0x000A, 0x0010),
+        lw(0x000E, 0x020C),
+        lw(0x0010, 0x3C3C),
+        lw(0x0022, 0x7F7F)])
+
+@test
+fn test_the_power_up_with_an_external_vddd_and_low_supplies() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.step_power_up(d, cfg_of(12288000, 1800, 1800, true)))
+    test.assert_eq(at(c.log, 1), lw(0x0030, 0x4060))
+    test.assert_eq(at(c.log, 4), lw(0x0030, 0x4860))
+    test.assert_eq(reg_of(c, 0x0030), 0x48FF)
+    test.assert_eq(reg_of(c, 0x0026), 0x0000)
+
+@test
+fn test_the_power_up_keeps_the_pll_bits_a_format_set() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0030, 0x7560)
+    test.assert(sgtl5000.step_power_up(d, cfg_of(12000000, 3300, 3300, false)))
+    test.assert_eq(at(c.log, 2), lw(0x0030, 0x7760))
+    test.assert_eq(reg_of(c, 0x0030), 0x67FF)
+
+@test
+fn test_every_refusal_of_a_write_in_the_power_up_is_reported() [io, hw]
+    for n in 1..15
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not sgtl5000.step_power_up(dut(c), sgtl5000.config_default(12288000)))
+    let ok = chip()
+    ok.st.insert(2, 15)
+    test.assert(sgtl5000.step_power_up(dut(ok), sgtl5000.config_default(12288000)))
+    for n in 1..17
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not sgtl5000.step_power_up(dut(c), cfg_of(12288000, 1800, 1800, false)))
+    let ext = chip()
+    ext.st.insert(2, 1)
+    test.assert(not sgtl5000.step_power_up(dut(ext), cfg_of(12288000, 3300, 3300, true)))
+    let rd = chip()
+    rd.st.insert(5, 0x0030 + 1)
+    test.assert(not sgtl5000.step_power_up(dut(rd), sgtl5000.config_default(12288000)))
+    let rd2 = chip()
+    rd2.st.insert(5, 0x0034 + 1)
+    test.assert(not sgtl5000.step_power_up(dut(rd2), cfg_of(12288000, 1800, 1800, false)))
+
+@test
+fn test_the_power_down_mutes_waits_for_the_vag_and_then_powers_down() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0030, 0x62FF)
+    c.regs.insert(0x0024, 0x0000)
+    c.regs.insert(0x000E, 0x0200)
+    test.assert(sgtl5000.step_power_down(d))
+    log_is(c, [lr(0x000E), lw(0x000E, 0x020C),
+        lr(0x000E),
+        lr(0x0024), lw(0x0024, 0x0110),
+        lr(0x0030), lw(0x0030, 0x627F),
+        lp(500),
+        lr(0x0030), lw(0x0030, 0x6260),
+        lw(0x0002, 0x0000)])
+
+@test
+fn test_every_refusal_in_the_power_down_is_reported() [io, hw]
+    for n in 1..6
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not sgtl5000.step_power_down(dut(c)))
+    let ok = chip()
+    ok.st.insert(2, 6)
+    test.assert(sgtl5000.step_power_down(dut(ok)))
+    let slow = chip()
+    slow.st.insert(10, 1000)
+    test.assert(not sgtl5000.step_power_down(dut(slow)))
+
+@test
+fn test_power_on_and_off_through_the_handle() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let k = sgtl5000.config_default(12288000)
+    test.assert(sgtl5000.power_set(d, l, k, true))
+    test.assert_eq(at(l.st, 10), 0)
+    log_clear(c)
+    test.assert(sgtl5000.power_set(d, l, k, false))
+    test.assert_eq(at(l.st, 10), 1)
+    c.st.insert(2, 1)
+    c.st.insert(1, 0)
+    test.assert(not sgtl5000.power_set(d, l, k, false))
+    test.assert_eq(at(l.st, 10), 2)
+
+// ── Format ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_synchronous_format_writes_the_clock_powers_the_pll_down_and_sets_the_port() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    c.regs.insert(0x0030, 0x7560)
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(sgtl5000.format_set(d, l, cfg_of(12288000, 3300, 3300, false), f))
+    log_is(c, [lw(0x0004, 0x0008), lr(0x0030), lw(0x0030, 0x7060), lw(0x0006, 0x0130)])
+    test.assert_eq(at(l.st, 0), 1)
+    test.assert_eq(at(l.st, 1), 48000)
+    test.assert_eq(at(l.st, 2), 16)
+    test.assert_eq(at(l.st, 4), 0)
+    test.assert_eq(at(l.st, 6), 1)
+
+@test
+fn test_a_pll_format_writes_the_divisors_powers_the_pll_and_waits_for_the_lock() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, true)
+    test.assert(sgtl5000.format_set(d, l, cfg_of(12000000, 3300, 3300, false), f))
+    log_is(c, [lw(0x0032, 0x8312),
+        lr(0x0034), lw(0x0034, 0x0000),
+        lr(0x0030), lw(0x0030, 0x7560),
+        lr(0x0036),
+        lw(0x0004, 0x000B),
+        lw(0x0006, 0x01B0)])
+    test.assert_eq(at(l.st, 4), 1)
+
+@test
+fn test_a_pll_format_from_26_mhz_halves_the_input() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, true)
+    test.assert(sgtl5000.format_set(d, link(), cfg_of(26000000, 3300, 3300, false), f))
+    test.assert_eq(reg_of(c, 0x0034), 0x0008)
+    test.assert_eq(reg_of(c, 0x0032), (15 * 2048 + 253) * 1 + 0)
+    test.assert_eq(reg_of(c, 0x0006), 0x0082)
+
+@test
+fn test_the_pll_lock_is_polled_and_a_pll_that_never_locks_fails() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(11, 3)
+    test.assert(sgtl5000.pll_wait(d))
+    log_is(c, [lr(0x0036), lp(1), lr(0x0036), lp(1), lr(0x0036), lp(1), lr(0x0036)])
+    c.st.insert(11, 1000)
+    test.assert(not sgtl5000.pll_wait(d))
+    test.assert_eq(at(c.st, 9), 100)
+    c.st.insert(5, 0x0036 + 1)
+    test.assert(not sgtl5000.pll_wait(d))
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, true)
+    let c2 = chip()
+    c2.st.insert(11, 1000)
+    test.assert(not sgtl5000.format_set(dut(c2), link(), cfg_of(12000000, 3300, 3300, false), f))
+    test.assert_eq(reg_of(c2, 0x0004), 0x0008)
+
+@test
+fn test_a_format_the_part_or_the_handle_refuses_writes_nothing() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let k = cfg_of(12288000, 3300, 3300, false)
+    test.assert(not sgtl5000.format_set(d, l, k, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(at(l.st, 0), 0)
+    l.st.insert(8, 1)
+    test.assert(not sgtl5000.format_set(d, l, k, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)))
+    l.st.insert(8, 0)
+    l.st.insert(13, 1)
+    test.assert(not sgtl5000.format_set(d, l, k, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)))
+    test.assert(not sgtl5000.i2s_start(l, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)))
+    log_is(c, [])
+
+@test
+fn test_every_refusal_of_a_write_in_the_format_is_reported() [io, hw]
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)
+    for n in 1..4
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not sgtl5000.format_set(dut(c), link(), cfg_of(12288000, 3300, 3300, false), f))
+    let fp = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, true)
+    for n in 1..5
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert(not sgtl5000.format_set(dut(c), link(), cfg_of(12000000, 3300, 3300, false), fp))
+    let c2 = chip()
+    c2.st.insert(5, 0x0034 + 1)
+    test.assert(not sgtl5000.format_set(dut(c2), link(), cfg_of(12000000, 3300, 3300, false), fp))
+
+@test
+fn test_the_handle_is_started_for_the_format_so_that_mclk_runs() [io, hw]
+    let l = link()
+    test.assert(sgtl5000.i2s_start(l, fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, false)))
+    test.assert_eq(at(l.st, 2), 32)
+    test.assert_eq(at(l.st, 5), 1)
+    test.assert_eq(at(l.st, 6), 1)
+
+// ── Mute and gain ────────────────────────────────────────────────────
+
+@test
+fn test_muting_ramps_the_dac_down_before_the_analogue_mutes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x000E, 0x0200)
+    c.regs.insert(0x0024, 0x0020)
+    c.st.insert(10, 2)
+    test.assert(sgtl5000.mute_set(d, true))
+    log_is(c, [lr(0x000E), lw(0x000E, 0x320C),
+        lr(0x000E), lp(10), lr(0x000E),
+        lr(0x0024), lw(0x0024, 0x0130)])
+    test.assert(sgtl5000.mute_get(d) == Some(true))
+
+@test
+fn test_unmuting_sets_the_analogue_unmutes_first_and_then_ramps_the_dac_up() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x000E, 0x020C)
+    c.regs.insert(0x0024, 0x0133)
+    test.assert(sgtl5000.mute_set(d, false))
+    log_is(c, [lr(0x0024), lw(0x0024, 0x0023), lr(0x000E), lw(0x000E, 0x0200)])
+    test.assert(sgtl5000.mute_get(d) == Some(false))
+    c.st.insert(5, 0x000E + 1)
+    test.assert(sgtl5000.mute_get(d) == None)
+
+@test
+fn test_a_ramp_that_does_not_end_still_sets_the_analogue_mutes_and_reports_it() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.st.insert(10, 1000)
+    test.assert(not sgtl5000.mute_set(d, true))
+    test.assert_eq(reg_of(c, 0x0024) & 0x0110, 0x0110)
+    test.assert_eq(at(c.st, 6), 50)
+    c.st.insert(5, 0x000E + 1)
+    test.assert(not sgtl5000.ramp_wait(d))
+
+@test
+fn test_every_refusal_of_a_write_in_the_mute_is_reported() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not sgtl5000.mute_set(dut(c), true))
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not sgtl5000.mute_set(dut(c2), true))
+    let c3 = chip()
+    c3.st.insert(2, 1)
+    test.assert(not sgtl5000.mute_set(dut(c3), false))
+    let c4 = chip()
+    c4.st.insert(2, 2)
+    test.assert(not sgtl5000.mute_set(dut(c4), false))
+
+@test
+fn test_the_headphone_codes_run_from_plus_12_db_to_minus_51_5_db() [io]
+    test.assert(sgtl5000.hp_code(db(12000)) == Some(0))
+    test.assert(sgtl5000.hp_code(db(0)) == Some(24))
+    test.assert(sgtl5000.hp_code(db(-51500)) == Some(127))
+    test.assert(sgtl5000.hp_code(db(-6100)) == Some(37))
+    test.assert(sgtl5000.hp_code(db(20000)) == Some(0))
+    test.assert(sgtl5000.hp_code(db(-51501)) == None)
+    test.assert_eq(sgtl5000.hp_mdb(0), 12000)
+    test.assert_eq(sgtl5000.hp_mdb(24), 0)
+    test.assert_eq(sgtl5000.hp_mdb(127), -51500)
+
+fn adc_is(v: ?AdcVolume, m6: Bool, code: Int)
+    match v
+        Some(x) =>
+            test.assert(x.m6 == m6)
+            test.assert_eq(x.code, code)
+        None    => test.assert(false)
+
+@test
+fn test_the_adc_volume_uses_the_shifted_range_below_0_db() [io]
+    adc_is(sgtl5000.adc_volume_of(db(0)), false, 0)
+    adc_is(sgtl5000.adc_volume_of(db(22500)), false, 15)
+    adc_is(sgtl5000.adc_volume_of(db(30000)), false, 15)
+    adc_is(sgtl5000.adc_volume_of(db(1600)), false, 1)
+    adc_is(sgtl5000.adc_volume_of(db(-6000)), true, 0)
+    adc_is(sgtl5000.adc_volume_of(db(-1)), true, 3)
+    test.assert(sgtl5000.adc_volume_of(db(-6001)) == None)
+    test.assert_eq(sgtl5000.adc_volume_mdb(AdcVolume { m6: true, code: 0 }), -6000)
+    test.assert_eq(sgtl5000.adc_volume_mdb(AdcVolume { m6: true, code: 15 }), 16500)
+    test.assert_eq(sgtl5000.adc_volume_mdb(AdcVolume { m6: false, code: 15 }), 22500)
+
+@test
+fn test_the_output_gain_is_the_headphone_volume_of_both_channels() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecOutput, db(0)) == Some(db(0)))
+    log_is(c, [lw(0x0022, 0x1818)])
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecOutput, db(-6100)) == Some(db(-6500)))
+    test.assert_eq(reg_of(c, 0x0022), 0x2525)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecOutput, db(-52000)) == None)
+    log_clear(c)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecOutput) == Some(db(-6500)))
+    log_is(c, [lr(0x0022)])
+    c.st.insert(5, 0x0022 + 1)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecOutput) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecOutput, db(0)) == None)
+
+@test
+fn test_the_input_gain_is_the_adc_volume_of_both_channels() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecInput, db(4600)) == Some(db(4500)))
+    log_is(c, [lw(0x0020, 0x0033)])
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecInput, db(-3000)) == Some(db(-3000)))
+    test.assert_eq(reg_of(c, 0x0020), 0x0122)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecInput, db(-7000)) == None)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecInput) == Some(db(-3000)))
+    c.st.insert(5, 0x0020 + 1)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecInput) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecInput, db(0)) == None)
+
+@test
+fn test_the_dac_volume_is_half_decibel_steps_from_code_0x3c() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.dac_volume_set(d, db(0)) == Some(db(0)))
+    log_is(c, [lw(0x0010, 0x3C3C)])
+    test.assert(sgtl5000.dac_volume_set(d, db(-90000)) == Some(db(-90000)))
+    test.assert_eq(reg_of(c, 0x0010), 0xF0F0)
+    test.assert(sgtl5000.dac_volume_set(d, db(-1200)) == Some(db(-1000 - 500)))
+    test.assert_eq(reg_of(c, 0x0010), 0x3F3F)
+    test.assert(sgtl5000.dac_volume_set(d, db(5000)) == Some(db(0)))
+    test.assert(sgtl5000.dac_volume_set(d, db(-90001)) == None)
+    c.regs.insert(0x0010, 0x3F3F)
+    test.assert(sgtl5000.dac_volume_get(d) == Some(db(-1500)))
+    c.regs.insert(0x0010, 0xFFFF)
+    test.assert(sgtl5000.dac_volume_get(d) == Some(db(-90000)))
+    c.regs.insert(0x0010, 0x0000)
+    test.assert(sgtl5000.dac_volume_get(d) == Some(db(0)))
+    c.st.insert(5, 0x0010 + 1)
+    test.assert(sgtl5000.dac_volume_get(d) == None)
+    c.st.insert(5, 0)
+    c.st.insert(2, 1)
+    test.assert(sgtl5000.dac_volume_set(d, db(0)) == None)
+
+// ── The settings the trait has no place for ──────────────────────────
+
+@test
+fn test_the_ramp_and_the_line_out_level() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.ramp_set(d, false, false))
+    test.assert_eq(reg_of(c, 0x000E), 0x000C)
+    test.assert(sgtl5000.ramp_set(d, true, true))
+    test.assert_eq(reg_of(c, 0x000E), 0x030C)
+    test.assert(sgtl5000.ramp_set(d, true, false))
+    test.assert_eq(reg_of(c, 0x000E), 0x020C)
+    test.assert(sgtl5000.lineout_level_set(d, 31))
+    test.assert_eq(reg_of(c, 0x002E), 0x1F1F)
+    test.assert(not sgtl5000.lineout_level_set(d, 32))
+    test.assert(not sgtl5000.lineout_level_set(d, -1))
+
+@test
+fn test_the_routes_are_written_whole() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.route_set(d, Route.RouteAdcToDac))
+    log_is(c, [lw(0x000A, 0x0000)])
+    test.assert(sgtl5000.route_set(d, Route.RouteI2sThrough))
+    log_is(c, [lw(0x000A, 0x0011)])
+    test.assert(sgtl5000.route_set(d, Route.RouteCodec))
+    log_is(c, [lw(0x000A, 0x0010)])
+
+@test
+fn test_the_input_the_bypass_and_the_zero_cross_detectors() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0024, 0x0000)
+    test.assert(sgtl5000.mic_input_set(d, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0004)
+    test.assert(sgtl5000.mic_input_set(d, true))
+    test.assert_eq(reg_of(c, 0x0024), 0x0000)
+    test.assert(sgtl5000.hp_bypass_set(d, true))
+    test.assert_eq(reg_of(c, 0x0024), 0x0040)
+    test.assert(sgtl5000.hp_bypass_set(d, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0000)
+    test.assert(sgtl5000.zero_cross_set(d, true, true))
+    test.assert_eq(reg_of(c, 0x0024), 0x0022)
+    test.assert(sgtl5000.zero_cross_set(d, true, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0020)
+    test.assert(sgtl5000.zero_cross_set(d, false, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0000)
+
+@test
+fn test_the_microphone_amplifier_has_0_20_30_and_40_db() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.mic_gain_code(db(-1)) == None)
+    test.assert(sgtl5000.mic_gain_code(db(0)) == Some(0))
+    test.assert(sgtl5000.mic_gain_code(db(19999)) == Some(0))
+    test.assert(sgtl5000.mic_gain_code(db(20000)) == Some(1))
+    test.assert(sgtl5000.mic_gain_code(db(30000)) == Some(2))
+    test.assert(sgtl5000.mic_gain_code(db(40000)) == Some(3))
+    test.assert(sgtl5000.mic_gain_code(db(50000)) == Some(3))
+    test.assert_eq(sgtl5000.mic_gain_mdb(0), 0)
+    test.assert_eq(sgtl5000.mic_gain_mdb(1), 20000)
+    test.assert_eq(sgtl5000.mic_gain_mdb(2), 30000)
+    test.assert_eq(sgtl5000.mic_gain_mdb(3), 40000)
+    c.regs.insert(0x002A, 0x0370)
+    test.assert(sgtl5000.mic_gain_set(d, db(35000)) == Some(db(30000)))
+    test.assert_eq(reg_of(c, 0x002A), 0x0372)
+    test.assert(sgtl5000.mic_gain_set(d, db(-1)) == None)
+    c.st.insert(2, 1)
+    test.assert(sgtl5000.mic_gain_set(d, db(0)) == None)
+
+@test
+fn test_the_microphone_bias_resistor_and_voltage() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x002A, 0x0003)
+    test.assert(sgtl5000.mic_bias_set(d, 2000, 3000))
+    test.assert_eq(reg_of(c, 0x002A), 0x0173)
+    test.assert(sgtl5000.mic_bias_set(d, 4000, 1250))
+    test.assert_eq(reg_of(c, 0x002A), 0x0203)
+    test.assert(sgtl5000.mic_bias_set(d, 8000, 2000))
+    test.assert_eq(reg_of(c, 0x002A), 0x0333)
+    test.assert(sgtl5000.mic_bias_set(d, 0, 1250))
+    test.assert_eq(reg_of(c, 0x002A), 0x0003)
+    log_clear(c)
+    test.assert(not sgtl5000.mic_bias_set(d, 1000, 1250))
+    test.assert(not sgtl5000.mic_bias_set(d, 2000, 1000))
+    test.assert(not sgtl5000.mic_bias_set(d, 2000, 3250))
+    test.assert(not sgtl5000.mic_bias_set(d, 2000, 1300))
+    log_is(c, [])
+
+@test
+fn test_the_right_justified_and_pcm_formats() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0006, 0x0130)
+    test.assert(sgtl5000.rj_format_set(d))
+    test.assert_eq(reg_of(c, 0x0006), 0x0034)
+    test.assert(sgtl5000.pcm_format_set(d, false))
+    test.assert_eq(reg_of(c, 0x0006), 0x0038)
+    test.assert(sgtl5000.pcm_format_set(d, true))
+    test.assert_eq(reg_of(c, 0x0006), 0x003A)
+
+@test
+fn test_the_clock_and_port_steps_by_name() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    match sgtl5000.clock_plan(8192000, 16000, false, false)
+        Some(k) =>
+            test.assert(sgtl5000.step_clock(d, k))
+            log_is(c, [lw(0x0004, 0x0010), lr(0x0030), lw(0x0030, 0x7060)])
+        None => test.assert(false)
+    test.assert(sgtl5000.step_i2s(d, fmt_of(48000, 16, 2, AudioFraming.AudioLeftJustified, false)))
+    log_is(c, [lw(0x0006, 0x0132)])
+    test.assert(sgtl5000.step_i2s(d, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, true)))
+    log_is(c, [lw(0x0006, 0x0080)])
+
+@test
+fn test_the_status_bits() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.pll_locked(d) == Some(true))
+    test.assert(sgtl5000.short_detected(d) == Some(false))
+    c.st.insert(11, 5)
+    c.regs.insert(0x0036, 0x0200)
+    test.assert(sgtl5000.pll_locked(d) == Some(false))
+    test.assert(sgtl5000.short_detected(d) == Some(true))
+    c.regs.insert(0x0036, 0x0100)
+    test.assert(sgtl5000.short_detected(d) == Some(true))
+    c.st.insert(5, 0x0036 + 1)
+    test.assert(sgtl5000.pll_locked(d) == None)
+    test.assert(sgtl5000.short_detected(d) == None)
+
+// ── The type over absent hardware ────────────────────────────────────
+
+fn absent() -> sgtl5000.Sgtl5000<Link>
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    sgtl5000.attach(BoardI2c { id: 0 }, w, link(), sgtl5000.config_default(12288000))
+
+@test
+fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io, hw]
+    let p = absent()
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0010) == None)
+    test.assert(not p.set_reg(0x0010, 1))
+    test.assert(p.set_dac_volume(db(0)) == None)
+    test.assert(p.dac_volume() == None)
+    test.assert(not p.set_ramp(true, false))
+    test.assert(not p.set_lineout_level(5))
+    test.assert(not p.set_route(Route.RouteCodec))
+    test.assert(not p.set_mic_input(true))
+    test.assert(not p.set_hp_bypass(true))
+    test.assert(not p.set_zero_cross(true, true))
+    test.assert(p.set_mic_gain(db(20000)) == None)
+    test.assert(not p.set_mic_bias(2000, 3000))
+    test.assert(not p.set_rj_format())
+    test.assert(not p.set_pcm_format(true))
+    test.assert(p.locked() == None)
+    test.assert(p.shorted() == None)
+    test.assert(not p.codec_set_mute(true))
+    test.assert(p.codec_is_muted() == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecOutput, db(0)) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecInput, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecOutput) == None)
+    test.assert(p.codec_gain(CodecPath.CodecInput) == None)
+    test.assert(p.device_id() == None)
+    test.assert(not p.device_probe(0xA0))
+
+@test
+fn test_power_and_format_on_absent_hardware_report_false_and_stop_the_handle() [io, hw]
+    let p = absent()
+    test.assert(not p.codec_set_power(true))
+    test.assert(not p.codec_set_power(false))
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(not p.codec_set_format(f))
+    test.assert(not p.start_clock(fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)))
+    p.i2s_stop()
+
+// The real pause is the board's timer; one millisecond is waited here.
+@test
+fn test_the_pause_of_the_type_waits_on_the_boards_timer() [io, hw]
+    absent().pause_ms(1)
+    test.assert(true)
