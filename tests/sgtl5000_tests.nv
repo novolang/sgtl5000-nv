@@ -1045,7 +1045,7 @@ fn test_the_clock_and_port_steps_by_name() [io, hw]
         Some(k) =>
             test.assert(sgtl5000.step_clock(d, k))
             log_is(c, [lw(0x0004, 0x0010), lr(0x0030), lw(0x0030, 0x7060)])
-        None => test.assert(false)
+        None    => test.assert(false)
     test.assert(sgtl5000.step_i2s(d, fmt_of(48000, 16, 2, AudioFraming.AudioLeftJustified, false)))
     log_is(c, [lw(0x0006, 0x0132)])
     test.assert(sgtl5000.step_i2s(d, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, true)))
