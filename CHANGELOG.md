@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `codec_start(f)` replaces the inherent `start_clock` and `begin`: it starts the
+  I2S handle so that SYS_MCLK runs, reads the chip ID and leaves the part quiet,
+  and answers 0 microseconds to wait or -1. The device program and the example
+  call it, and print one refusal line for the two causes.
+- `codec_set_gain` takes `CodecHeadphone` (the headphone volume, as
+  `CodecOutput`) and `CodecDac` (the DAC's digital volume), which replaces the
+  inherent `set_dac_volume` and `dac_volume`. The line out, the speaker and
+  `CodecAdc` answer `None`.
+- `codec_select_output` powers the headphone or the line-out driver up or down;
+  `codec_set_path_mute` and `codec_path_muted` mute the headphone, the line out,
+  the input, the DAC or the whole output.
+- The framings `AudioRightJustified`, `AudioDspA` and `AudioDspB` replace the
+  inherent `set_rj_format` and `set_pcm_format`; they are part of the format and
+  written with it. `AudioPdm` is refused.
+- `slot_bits` is read: 24-bit samples in a 64-clock frame (`slot_bits` 32) and
+  16-bit samples in a 64-clock frame are accepted, and `i2s_config_of` passes
+  `slot_bits` to the handle. A 24-bit format with `slot_bits` 0 is still refused.
+  The right-justified form needs the 64-clock frame.
+- A record literal of `AudioFormat` adds `slot_bits`.
+
 ## 0.1.0
 
 The first release: a driver for NXP's SGTL5000 low-power stereo codec on an

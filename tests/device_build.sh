@@ -30,8 +30,8 @@ main    = "src/main.nv"
 
 [dependencies]
 sgtl5000-nv = { path = "$PKG" }
-devices-nv      = "^0.3.3"
-embedded-hal-nv = "^0.3.3"
+devices-nv      = { path = "$PKG/../devices-nv" }
+embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
 EOF
 
 fail=0
@@ -59,10 +59,10 @@ if ! command -v qemu-system-arm >/dev/null 2>&1; then
 elif [ -f "$WORK/nrf52-qemu.elf" ]; then
   out=$(timeout 8 qemu-system-arm -machine mps2-an386 -nographic -semihosting \
           -kernel "$WORK/nrf52-qemu.elf" 2>&1 | head -20)
-  if printf '%s\n' "$out" | tr -d '\r' | grep -qx 'no answer from the codec at 0x0A'; then
-    echo "  ✓ the image runs under QEMU and prints 'no answer from the codec at 0x0A'"
+  if printf '%s\n' "$out" | tr -d '\r' | grep -qx 'codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A'; then
+    echo "  ✓ the image runs under QEMU and prints 'codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A'"
   else
-    echo "  ✗ the image under QEMU did not print 'no answer from the codec at 0x0A'"
+    echo "  ✗ the image under QEMU did not print 'codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A'"
     printf '%s\n' "$out" | head -10 | sed 's/^/      /'
     fail=1
   fi

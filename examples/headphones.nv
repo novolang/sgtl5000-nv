@@ -19,8 +19,8 @@
  *
  * The program does what a player does, in the order the package's
  * documentation gives.  The part answers on I2C only while SYS_MCLK runs, so
- * `start_clock` starts the board's I2S block first.  Then `begin` reads the
- * chip ID and mutes the part, `codec_set_power(true)` runs the data sheet's
+ * `codec_start` starts the board's I2S block first, then reads the chip ID
+ * and mutes the part; `codec_set_power(true)` runs the data sheet's
  * power-up, `codec_set_format` sets the clock and the serial port, the
  * headphone volume is set to -20 dB, and `codec_set_mute(false)` opens the
  * output once the first buffer is queued.  It prints one line per step over
@@ -34,8 +34,9 @@
  * package has an I2S block driver, and embedded-hal-nv has no board handle
  * for one.  The program is therefore written against the `I2s` trait and is
  * given `NoI2s`, a stand-in that refuses to be configured and moves no
- * samples.  The I2C bus is the boards' TWIM, so `begin` runs on the bus; with
- * no codec on it, both images print "no answer from the codec at 0x0A".  The
+ * samples (planning page 3.5, row "the hal").  The program stops at the first
+ * refusal: `codec_start` answers -1 for the stand-in, and both images print
+ * "codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A".  The
  * part has not been driven on a board.
  */
 use embedded_hal.{ I2s, I2sConfig, BoardI2c }
@@ -88,14 +89,14 @@ fn main() [hw]
     let i2s = NoI2s { id: 0 }
     let part = sgtl5000.attach(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, sgtl5000.address_of(false)), i2s,
                                sgtl5000.config_default(12288000))
-    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2,
+    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2, slot_bits: 0,
                           framing: AudioFraming.AudioPhilips, codec_is_master: false }
-    if not part.start_clock(f)
-        hal.uart.write("no SYS_MCLK: the I2S block refused\n")
-    if not part.begin()
-        hal.uart.write("no answer from the codec at 0x0A\n")
+    let wait_us = part.codec_start(f)
+    if wait_us < 0
+        hal.uart.write("codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A\n")
     else
         hal.uart.write("codec found\n")
+        hal.timer.delay_us(wait_us)
     if not part.codec_set_power(true)
         hal.uart.write("power up refused\n")
     if not part.codec_set_format(f)

@@ -75,13 +75,14 @@ fn main() [hw]
     // and the board gives it a SYS_MCLK of 12.288 MHz.
     let part = sgtl5000.attach(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, sgtl5000.address_of(false)),
                                NoI2s { id: 0 }, sgtl5000.config_default(12288000))
-    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2,
+    let f = AudioFormat { sample_rate: 48000, bit_depth: 16, channels: 2, slot_bits: 0,
                           framing: AudioFraming.AudioPhilips, codec_is_master: false }
     // The part answers on I2C only while SYS_MCLK runs, so the board's
     // I2S block is started first.
-    let _ = part.start_clock(f)
-    if not part.begin()
-        hal.uart.write("no answer from the codec at 0x0A\n")
+    // codec_start also reads the chip ID and leaves the part quiet.
+    let wait_us = part.codec_start(f)
+    if wait_us < 0
+        hal.uart.write("no SYS_MCLK or no answer from the codec at 0x0A\n")
         return
     if part.codec_set_power(true) and part.codec_set_format(f)
         let set = part.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: -20000 })
@@ -120,9 +121,10 @@ control port's I2C with a TWIM (the nRF52840 DK's TWIM0 on SDA P0.26 and SCL
 P0.27, the nRF54LM20 DK's TWIM22 on SDA P1.03 and SCL P1.04), on the pins
 `docs/hal/README.md` names under "The Nordic DKs' buses", so both images carry
 the driver's reading path. The program is written against the `I2s` trait and
-is given `NoI2s`, so on both images `begin` runs on the bus, finds no codec
-and prints `no answer from the codec at 0x0A`. A reply from the codec over a
-DK's bus is NOT VERIFIED until the driver rig carries one. The one argument of
+is given `NoI2s`, so on both images `codec_start` answers -1 and the program
+prints `codec_start refused: no SYS_MCLK or no answer from the codec at 0x0A`.
+A reply from the codec over a DK's bus is NOT VERIFIED until the driver rig
+carries one. The one argument of
 `attach` is what changes when a board package gives an I2S handle.
 
 ### The effects
@@ -150,7 +152,8 @@ high byte of register 0 and the revision in the low byte; `device_id` answers
 
 **The part has no reset and answers on I2C only while SYS_MCLK runs.** The
 internal reset ends 8 SYS_MCLK cycles after the supplies are up. So the board
-starts its I2S block first, with `start_clock(f)`, and calls `begin` after.
+starts its I2S block first. `codec_start(f)` does that, then reads the chip ID
+and leaves the part quiet, and answers the microseconds to wait (0) or -1.
 
 ### The power-up
 
@@ -169,7 +172,7 @@ with VDDD made by the chip):
 
 For VDDIO 3.3 V, VDDA 1.8 V and an internal VDDD the writes are the data
 sheet's example, byte for byte: 0x0008, 0x7260, 0x004E, 0x0322, 0x004F,
-0x1106, 0x0133, 0x6AFF, 0x0073 and 0x0505. `begin` runs a first step,
+0x1106, 0x0133, 0x6AFF, 0x0073 and 0x0505. `codec_start` ends with a first step,
 `step_quiet`: it mutes everything and, if VAG was left powered by an earlier
 run, switches it off and waits 500 ms for the ramp down, because writing
 ANA_POWER with it on pops.
@@ -211,17 +214,17 @@ and uses the traits on the result.
 | Method | What it does |
 |---|---|
 | `attach(bus, w, i2s, cfg)` | the codec at `w.addr` and the handle that carries its samples; nothing is sent |
-| `start_clock(f)` | configures and enables the I2S handle so that SYS_MCLK runs; before `begin` |
-| `begin()` | the bus ready, the chip ID read, the part muted and VAG switched off if it was on |
+| `codec_start(f)` | configures and enables the I2S handle so that SYS_MCLK runs, then the bus ready, the chip ID read, the part muted and VAG switched off if it was on; answers 0 microseconds to wait, or -1 |
 | `codec_set_power(on)` | the data sheet's power-up with everything muted, or the power-down, and disables the handle |
 | `codec_set_format(f)` | configures and enables the I2S handle, then the clock registers, the PLL if needed, and the serial port |
 | `codec_set_mute(on)`, `codec_is_muted()` | the DAC's soft mute and the headphone and line-out mutes, in the order that gives no click |
-| `codec_set_gain(path, g)`, `codec_gain(path)` | the headphone volume, or the ADC volume, to the largest step at or below `g` |
+| `codec_set_gain(path, g)`, `codec_gain(path)` | the headphone volume (`CodecOutput`, `CodecHeadphone`), the DAC's digital volume (`CodecDac`), or the ADC volume (`CodecInput`), to the largest step at or below `g`; the line out, the speaker and `CodecAdc` answer `None` |
+| `codec_select_output(path, on)` | powers the headphone or the line-out driver up or down in ANA_POWER |
+| `codec_set_path_mute(path, on)`, `codec_path_muted(path)` | the headphone, line-out or input mute bit of ANA_CTRL, the DAC's mute, or the whole output |
 | `device_id()` | `Identifiable`: PARTID 0xA0 and the revision |
-| `set_dac_volume(g)`, `set_ramp(on, expo)`, `set_lineout_level(code)` | the DAC volume, its ramp, the line-out level |
+| `set_ramp(on, expo)`, `set_lineout_level(code)` | the DAC volume ramp, the line-out level |
 | `set_route(r)`, `set_mic_input(mic)`, `set_hp_bypass(line)`, `set_zero_cross(hp, adc)` | the audio switch, the ADC input, the analogue bypass, the zero-cross detectors |
 | `set_mic_gain(g)`, `set_mic_bias(ohms, mv)` | the microphone amplifier and bias |
-| `set_rj_format()`, `set_pcm_format(b)` | the right-justified and PCM formats |
 | `locked()`, `shorted()` | the PLL lock and the headphone short flags |
 | `reg(r)`, `set_reg(r, v)`, `i2s_stop()` | one register, a write, and the handle's clocks stopped |
 
@@ -238,7 +241,7 @@ input gain is the ADC's analogue volume of both channels, 0 to +22.5 dB in
 the driver uses for a request below 0 dB. The gain a call sets is never above
 the request, and a request below the range sets nothing. The power-up leaves
 the headphone at -51.5 dB and the DAC at 0 dB, so a program raises the
-headphone volume before it unmutes. The DAC's volume is `set_dac_volume`, 0 to
+headphone volume before it unmutes. The DAC's volume is `CodecDac`, 0 to
 -90 dB. The line out has a level relative to its reference and not a gain,
 `set_lineout_level`, and the power-up sets it from the supplies by the data
 sheet's formula, 40 log10(VAG / reference) + 15, rounded up. The microphone
@@ -246,22 +249,26 @@ amplifier is `set_mic_gain`: 0, 20, 30 or 40 dB.
 
 ## The rules a user needs
 
-1. Start the board's I2S block (`start_clock`) before `begin`. The part does
-   not answer I2C without SYS_MCLK.
+1. Call `codec_start` first. It starts the board's I2S block, because the part
+   does not answer I2C without SYS_MCLK, and then identifies the part.
 2. Call `codec_set_power(true)` and `codec_set_format` in either order. The
    power-up keeps the PLL bits a format has set.
 3. `codec_set_power(true)` leaves everything muted. Open the output with
    `codec_set_mute(false)` once the first buffer is queued. The unmute sets the
    analogue unmutes first and then ramps the DAC up; the mute ramps the DAC
    down, waits for it to end and then sets the analogue mutes.
-4. A format is 16 or 32 bits and two channels: 16 bits are 32 bit clocks per
-   frame and 32 bits are 64. The part also has 20 and 24 bits in a 64-clock
-   frame, which `I2sConfig` cannot ask the handle for because it has one bit
-   depth and no slot width, so they are refused.
+4. A format is 16, 24 or 32 bits and two channels. The frame is two slots of
+   `slot_bits` clocks (the sample's depth when it is 0), and the part takes 32
+   or 64 clocks per frame: 16 bits in `slot_bits` 0 or 16 is 32 clocks, and 16
+   bits, 24 bits or 32 bits in `slot_bits` 32 is 64. A slot narrower than the
+   sample, 24 bits with `slot_bits` 0 (a 48-clock frame) and 8 bits are
+   refused. The right-justified form needs the 64-clock frame, as the data
+   sheet gives it no 32-clock form.
 5. The PLL needs the part as the I2S master, which means the board handle is
    the slave.
-6. `AudioFraming` names the I2S and left-justified formats only.
-   `set_rj_format` and `set_pcm_format` cover the others.
+6. `AudioPhilips`, `AudioLeftJustified`, `AudioRightJustified` and the PCM
+   forms `AudioDspA` and `AudioDspB` are the five framings of the serial port.
+   `AudioPdm` is refused: the part has no PDM input.
 
 ## What is not included
 
@@ -272,7 +279,8 @@ amplifier is `set_mic_gain`: 0, 20, 30 or 40 dB.
 - The pad drive strengths (CHIP_PAD_STRENGTH), the test registers, the ADC
   high-pass filter bits, the left-right swaps of CHIP_SSS_CTRL, and the DAC
   mono mode.
-- The 20 and 24 bit data lengths, mono formats, and the SPI port.
+- The 20 bit data length, which `AudioFormat` cannot name, mono formats, and
+  the SPI port.
 - The settling wait of `AudioCodecAsync.codec_power_up`: the power-up's wait of
   400 ms is taken in the synchronous step, and no timer-parking body is written.
 - The VDDD level of the chip's own regulator: the data sheet asks for
@@ -282,14 +290,15 @@ amplifier is `set_mic_gain`: 0, 20, 30 or 40 dB.
 
 ## Where the traits fall short
 
-- `AudioCodec` has one output gain and one input gain and no input mute. The
-  output gain here is the headphone; the DAC volume, the line-out level and
-  the microphone amplifier are the driver's own functions. The part has no
-  input mute apart from the ADC's analogue mute, which the driver does not
-  offer separately.
-- `AudioFraming` has two framings; the part also has right-justified and PCM.
-- `I2sConfig` has one `bit_depth`, which is both the slot width and the sample
-  width, so the 24-bit data of the part's 64-clock frame cannot be asked for.
+- The line out has a level code relative to its reference and not a gain in
+  decibels, so `codec_set_gain(CodecLine, g)` answers `None` and the level is
+  `set_lineout_level`. The microphone amplifier (0, 20, 30 and 40 dB) and its
+  bias are likewise the driver's own functions. Planning page 3.5, row
+  "AudioCodec" (per-output selection), still holds for these two.
+- A generic struct cannot be `@value`, so each `attach` allocates one arena
+  cell (planning page 3.4, row "a generic struct").
+- No board implements `I2s` and there is no `hal.i2s` hook, so the device
+  program runs against the stand-in `NoI2s` (planning page 3.5, row "the hal").
 - A trait method gets a plain `self`, so the driver keeps no state between
   calls; the part's registers are readable, so it needs none.
 

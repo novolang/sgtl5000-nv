@@ -18,8 +18,8 @@
 //
 // The I2S double's state, in `ist`: 0 configure calls, 1 sample rate, 2 bit
 // depth, 3 channels, 4 role (0 master, 1 slave), 5 format (0 Philips, 1
-// left-justified), 6 enabled, 8 refuse configure, 10 disable calls, 13
-// refuse enable.
+// left-justified, 2 right-justified, 3 DSP A, 4 DSP B), 6 enabled, 8 refuse
+// configure, 10 disable calls, 13 refuse enable, 14 slot bits.
 
 use std.test
 use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
@@ -192,10 +192,17 @@ impl I2s for Link
             self.st.insert(4, 0)
         else
             self.st.insert(4, 1)
+        self.st.insert(14, c.slot_bits)
         if c.format == I2sFormat.I2sPhilips
             self.st.insert(5, 0)
-        else
+        elif c.format == I2sFormat.I2sLeftJustified
             self.st.insert(5, 1)
+        elif c.format == I2sFormat.I2sRightJustified
+            self.st.insert(5, 2)
+        elif c.format == I2sFormat.I2sDspA
+            self.st.insert(5, 3)
+        else
+            self.st.insert(5, 4)
         true
 
     fn sample_rate(self) -> Int [hw]
@@ -221,8 +228,12 @@ impl I2s for Link
         0
 
 fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
-    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
-                  codec_is_master: master }
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, slot_bits: 0,
+                  framing: framing, codec_is_master: master }
+
+fn fmt_slot(depth: Int, slot: Int, framing: AudioFraming, master: Bool) -> AudioFormat
+    AudioFormat { sample_rate: 48000, bit_depth: depth, channels: 2, slot_bits: slot,
+                  framing: framing, codec_is_master: master }
 
 fn cfg_of(mclk: Int, vdda: Int, vddio: Int, ext: Bool) -> Sgtl5000Config
     Sgtl5000Config { mclk_hz: mclk, vdda_mv: vdda, vddio_mv: vddio, vddd_external: ext,
@@ -496,6 +507,29 @@ fn test_i2s_ctrl_packs_the_clock_the_role_the_length_and_the_framing() [io]
     test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)), -1)
 
 @test
+fn test_a_slot_wider_than_the_sample_makes_the_64_clock_frame() [io]
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 16, AudioFraming.AudioPhilips, false)), 0x0130)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 32, AudioFraming.AudioPhilips, false)), 0x0030)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(24, 32, AudioFraming.AudioPhilips, false)), 0x0010)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(24, 32, AudioFraming.AudioPhilips, true)), 0x0090)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(32, 32, AudioFraming.AudioPhilips, false)), 0x0000)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(24, 0, AudioFraming.AudioPhilips, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(8, 32, AudioFraming.AudioPhilips, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(24, 24, AudioFraming.AudioPhilips, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 64, AudioFraming.AudioPhilips, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(32, 16, AudioFraming.AudioPhilips, false)), -1)
+
+@test
+fn test_the_right_justified_dsp_and_pcm_framings_and_a_pdm_stream() [io]
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 32, AudioFraming.AudioRightJustified, false)), 0x0034)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(32, 0, AudioFraming.AudioRightJustified, false)), 0x0004)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 0, AudioFraming.AudioRightJustified, false)), -1)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 32, AudioFraming.AudioDspA, false)), 0x0038)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 32, AudioFraming.AudioDspB, false)), 0x003A)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 0, AudioFraming.AudioDspA, false)), 0x0138)
+    test.assert_eq(sgtl5000.i2s_ctrl_of(fmt_slot(16, 0, AudioFraming.AudioPdm, false)), -1)
+
+@test
 fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
     let a = sgtl5000.i2s_config_of(fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false))
     test.assert(a.role == I2sRole.I2sMaster)
@@ -503,6 +537,13 @@ fn test_the_i2s_settings_follow_the_framing_and_the_role() [io]
     let b = sgtl5000.i2s_config_of(fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, true))
     test.assert(b.role == I2sRole.I2sSlave)
     test.assert(b.format == I2sFormat.I2sLeftJustified)
+    test.assert_eq(b.slot_bits, 0)
+    let r = sgtl5000.i2s_config_of(fmt_slot(24, 32, AudioFraming.AudioRightJustified, false))
+    test.assert(r.format == I2sFormat.I2sRightJustified)
+    test.assert_eq(r.slot_bits, 32)
+    test.assert(sgtl5000.i2s_config_of(fmt_slot(16, 32, AudioFraming.AudioDspA, false)).format == I2sFormat.I2sDspA)
+    test.assert(sgtl5000.i2s_config_of(fmt_slot(16, 32, AudioFraming.AudioDspB, false)).format == I2sFormat.I2sDspB)
+    test.assert(sgtl5000.i2s_config_of(fmt_slot(16, 0, AudioFraming.AudioPdm, false)).format == I2sFormat.I2sPhilips)
 
 @test
 fn test_the_plan_for_a_format_refuses_what_the_part_cannot_frame() [io]
@@ -510,6 +551,8 @@ fn test_the_plan_for_a_format_refuses_what_the_part_cannot_frame() [io]
     clock_is(sgtl5000.plan_of(c, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)), 2, 0, 0)
     test.assert(sgtl5000.plan_of(c, fmt_of(48000, 16, 1, AudioFraming.AudioPhilips, false)) == None)
     test.assert(sgtl5000.plan_of(c, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) == None)
+    clock_is(sgtl5000.plan_of(c, fmt_slot(24, 32, AudioFraming.AudioPhilips, false)), 2, 0, 0)
+    test.assert(sgtl5000.plan_of(c, fmt_slot(16, 0, AudioFraming.AudioPdm, false)) == None)
     test.assert(sgtl5000.plan_of(c, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(sgtl5000.plan_of(c, fmt_of(0, 16, 2, AudioFraming.AudioPhilips, false)) == None)
 
@@ -785,6 +828,44 @@ fn test_every_refusal_of_a_write_in_the_format_is_reported() [io, hw]
     test.assert(not sgtl5000.format_set(dut(c2), link(), cfg_of(12000000, 3300, 3300, false), fp))
 
 @test
+fn test_a_24_bit_format_in_a_64_clock_frame_reaches_the_port_and_the_handle() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let k = cfg_of(12288000, 3300, 3300, false)
+    test.assert(sgtl5000.format_set(d, l, k, fmt_slot(24, 32, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(reg_of(c, 0x0006), 0x0010)
+    test.assert_eq(at(l.st, 2), 24)
+    test.assert_eq(at(l.st, 14), 32)
+    test.assert(sgtl5000.format_set(d, l, k, fmt_slot(16, 32, AudioFraming.AudioRightJustified, false)))
+    test.assert_eq(reg_of(c, 0x0006), 0x0034)
+    test.assert_eq(at(l.st, 5), 2)
+    test.assert(sgtl5000.format_set(d, l, k, fmt_slot(16, 32, AudioFraming.AudioDspB, false)))
+    test.assert_eq(reg_of(c, 0x0006), 0x003A)
+    test.assert_eq(at(l.st, 5), 4)
+    test.assert(sgtl5000.format_set(d, l, k, fmt_slot(16, 32, AudioFraming.AudioDspA, false)))
+    test.assert_eq(reg_of(c, 0x0006), 0x0038)
+    test.assert_eq(at(l.st, 5), 3)
+
+@test
+fn test_the_start_step_starts_the_handle_then_identifies_the_part() [io, hw]
+    let c = chip()
+    let l = link()
+    let d = dut(c)
+    let f = fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert_eq(sgtl5000.clock_start(d, l, f), 0)
+    test.assert_eq(at(l.st, 6), 1)
+    log_is(c, [lr(0x0000), lw(0x0024, 0x0133), lr(0x0030)])
+    let l2 = link()
+    l2.st.insert(8, 1)
+    test.assert_eq(sgtl5000.clock_start(d, l2, f), -1)
+    log_is(c, [])
+    c.regs.insert(0x0000, 0x1234)
+    test.assert_eq(sgtl5000.clock_start(d, link(), f), -1)
+    log_is(c, [lr(0x0000)])
+    test.assert_eq(sgtl5000.clock_start(d, link(), fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)), -1)
+
+@test
 fn test_the_handle_is_started_for_the_format_so_that_mclk_runs() [io, hw]
     let l = link()
     test.assert(sgtl5000.i2s_start(l, fmt_of(48000, 32, 2, AudioFraming.AudioLeftJustified, false)))
@@ -896,6 +977,25 @@ fn test_the_output_gain_is_the_headphone_volume_of_both_channels() [io, hw]
     test.assert(sgtl5000.gain_set(d, CodecPath.CodecOutput, db(0)) == None)
 
 @test
+fn test_the_headphone_is_the_output_gain_and_the_dac_is_its_digital_volume() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecHeadphone, db(-6100)) == Some(db(-6500)))
+    test.assert_eq(reg_of(c, 0x0022), 0x2525)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecHeadphone) == Some(db(-6500)))
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecDac, db(-1200)) == Some(db(-1500)))
+    test.assert_eq(reg_of(c, 0x0010), 0x3F3F)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecDac) == Some(db(-1500)))
+    log_clear(c)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecLine, db(0)) == None)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecSpeaker, db(0)) == None)
+    test.assert(sgtl5000.gain_set(d, CodecPath.CodecAdc, db(0)) == None)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecLine) == None)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecSpeaker) == None)
+    test.assert(sgtl5000.gain_get(d, CodecPath.CodecAdc) == None)
+    log_is(c, [])
+
+@test
 fn test_the_input_gain_is_the_adc_volume_of_both_channels() [io, hw]
     let c = chip()
     let d = dut(c)
@@ -934,6 +1034,67 @@ fn test_the_dac_volume_is_half_decibel_steps_from_code_0x3c() [io, hw]
     c.st.insert(5, 0)
     c.st.insert(2, 1)
     test.assert(sgtl5000.dac_volume_set(d, db(0)) == None)
+
+@test
+fn test_one_output_driver_is_powered_up_or_down_in_ana_power() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0030, 0x72FF)
+    test.assert(sgtl5000.output_select(d, CodecPath.CodecHeadphone, false))
+    test.assert_eq(reg_of(c, 0x0030), 0x72EB)
+    test.assert(sgtl5000.output_select(d, CodecPath.CodecLine, false))
+    test.assert_eq(reg_of(c, 0x0030), 0x72EA)
+    test.assert(sgtl5000.output_select(d, CodecPath.CodecHeadphone, true))
+    test.assert_eq(reg_of(c, 0x0030), 0x72FE)
+    test.assert(sgtl5000.output_select(d, CodecPath.CodecLine, true))
+    test.assert_eq(reg_of(c, 0x0030), 0x72FF)
+    log_clear(c)
+    test.assert(not sgtl5000.output_select(d, CodecPath.CodecSpeaker, true))
+    test.assert(not sgtl5000.output_select(d, CodecPath.CodecOutput, true))
+    log_is(c, [])
+
+@test
+fn test_a_path_mute_is_an_ana_ctrl_bit_for_the_analogue_paths() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0024, 0x0133)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecHeadphone) == Some(true))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecHeadphone, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0123)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecHeadphone) == Some(false))
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecLine) == Some(true))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecLine, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0023)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecInput) == Some(true))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecInput, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0022)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecInput) == Some(false))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecLine, true))
+    test.assert_eq(reg_of(c, 0x0024), 0x0122)
+    c.st.insert(5, 0x0024 + 1)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecInput) == None)
+
+@test
+fn test_the_output_and_the_dac_path_mutes_and_the_paths_without_a_mute() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x000E, 0x020C)
+    c.regs.insert(0x0024, 0x0133)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecDac) == Some(true))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecDac, false))
+    test.assert_eq(reg_of(c, 0x000E), 0x0200)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecDac) == Some(false))
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecDac, true))
+    test.assert_eq(reg_of(c, 0x000E), 0x020C)
+    test.assert(sgtl5000.path_mute_set(d, CodecPath.CodecOutput, false))
+    test.assert_eq(reg_of(c, 0x0024), 0x0023)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecOutput) == Some(false))
+    log_clear(c)
+    test.assert(not sgtl5000.path_mute_set(d, CodecPath.CodecSpeaker, true))
+    test.assert(not sgtl5000.path_mute_set(d, CodecPath.CodecAdc, true))
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecSpeaker) == None)
+    test.assert(sgtl5000.path_mute_get(d, CodecPath.CodecAdc) == None)
+    log_is(c, [])
 
 // ── The settings the trait has no place for ──────────────────────────
 
@@ -1026,18 +1187,6 @@ fn test_the_microphone_bias_resistor_and_voltage() [io, hw]
     log_is(c, [])
 
 @test
-fn test_the_right_justified_and_pcm_formats() [io, hw]
-    let c = chip()
-    let d = dut(c)
-    c.regs.insert(0x0006, 0x0130)
-    test.assert(sgtl5000.rj_format_set(d))
-    test.assert_eq(reg_of(c, 0x0006), 0x0034)
-    test.assert(sgtl5000.pcm_format_set(d, false))
-    test.assert_eq(reg_of(c, 0x0006), 0x0038)
-    test.assert(sgtl5000.pcm_format_set(d, true))
-    test.assert_eq(reg_of(c, 0x0006), 0x003A)
-
-@test
 fn test_the_clock_and_port_steps_by_name() [io, hw]
     let c = chip()
     let d = dut(c)
@@ -1076,11 +1225,20 @@ fn absent() -> sgtl5000.Sgtl5000<Link>
 @test
 fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io, hw]
     let p = absent()
-    test.assert(not p.begin())
+    test.assert_eq(p.codec_start(fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)), -1)
     test.assert(p.reg(0x0010) == None)
     test.assert(not p.set_reg(0x0010, 1))
-    test.assert(p.set_dac_volume(db(0)) == None)
-    test.assert(p.dac_volume() == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecDac, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecDac) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecHeadphone, db(0)) == None)
+    test.assert(p.codec_gain(CodecPath.CodecHeadphone) == None)
+    test.assert(not p.codec_select_output(CodecPath.CodecHeadphone, true))
+    test.assert(not p.codec_set_path_mute(CodecPath.CodecInput, true))
+    test.assert(not p.codec_set_path_mute(CodecPath.CodecDac, true))
+    test.assert(not p.codec_set_path_mute(CodecPath.CodecOutput, true))
+    test.assert(p.codec_path_muted(CodecPath.CodecInput) == None)
+    test.assert(p.codec_path_muted(CodecPath.CodecDac) == None)
+    test.assert(p.codec_path_muted(CodecPath.CodecOutput) == None)
     test.assert(not p.set_ramp(true, false))
     test.assert(not p.set_lineout_level(5))
     test.assert(not p.set_route(Route.RouteCodec))
@@ -1089,8 +1247,6 @@ fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io,
     test.assert(not p.set_zero_cross(true, true))
     test.assert(p.set_mic_gain(db(20000)) == None)
     test.assert(not p.set_mic_bias(2000, 3000))
-    test.assert(not p.set_rj_format())
-    test.assert(not p.set_pcm_format(true))
     test.assert(p.locked() == None)
     test.assert(p.shorted() == None)
     test.assert(not p.codec_set_mute(true))
@@ -1109,7 +1265,7 @@ fn test_power_and_format_on_absent_hardware_report_false_and_stop_the_handle() [
     test.assert(not p.codec_set_power(false))
     let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
     test.assert(not p.codec_set_format(f))
-    test.assert(not p.start_clock(fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(p.codec_start(fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)), -1)
     p.i2s_stop()
 
 // The real pause is the board's timer; one millisecond is waited here.

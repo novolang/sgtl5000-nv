@@ -19,7 +19,8 @@
 // The part has no reset register: the internal reset ends 8 SYS_MCLK cycles
 // after the supplies are up, and the part answers on I2C only while SYS_MCLK
 // is present.  So SYS_MCLK has to run before the first access, and a program
-// starts the I2S handle first (`i2s_start`).
+// starts the I2S handle first: `codec_start` does it, and then identifies the
+// part (`clock_start`, `i2s_start`).
 //
 // The registers, as this driver uses them (Tables 16 to 39):
 //
@@ -437,21 +438,54 @@ pub fn clk_ctrl_of(k: SysClock) -> Int
 // ── The serial port ──────────────────────────────────────────────────
 
 // CHIP_I2S_CTRL's value for a format: the bit clock of 32 or 64 times the
-// word clock, the role, the data length and the framing; -1 for a depth the
-// frame cannot carry.  16 bits are 32 clocks per frame, 32 bits are 64; 20
-// and 24 bits are in a slot of 32 and a frame of 64, which `I2sConfig` cannot
-// ask the handle for, so they are refused.
+// word clock, the role, the data length and the framing; -1 for what the
+// frame cannot carry.  The frame is two slots (`slot_bits`, or the sample's
+// depth when it is 0), so a slot of 16 bits is 32 clocks and a slot of 32
+// bits is 64.  The data length is 16, 24 or 32 bits, and a slot narrower than
+// the sample or a frame of another size is refused; so is a right-justified
+// frame of 32 clocks, which the part does not support, and a PDM stream.
 pub fn i2s_ctrl_of(f: AudioFormat) -> Int
+    let clocks = 2 * dev_audio.audio_slot_bits(f)
     var v = 0
-    if f.bit_depth == 16
-        v = 0x0100 | (3 << 4)
-    elif f.bit_depth != 32
+    if clocks == 32
+        v = 0x0100
+    elif clocks != 64
+        return -1
+    let dlen = dlen_bits(f.bit_depth)
+    let mode = mode_bits(f.framing, clocks)
+    if dlen < 0 or mode < 0 or dev_audio.audio_slot_bits(f) < f.bit_depth
         return -1
     if f.codec_is_master
         v = v | 0x0080
-    if f.framing == AudioFraming.AudioLeftJustified
-        v = v | 0x0002
-    v
+    v | dlen | mode
+
+// CHIP_I2S_CTRL's DLEN field for a sample of `depth` bits; -1 for a depth the
+// field does not name (the part has 20 bits as well, which `AudioFormat`
+// does).
+fn dlen_bits(depth: Int) -> Int
+    if depth == 16
+        return 3 << 4
+    if depth == 24
+        return 1 << 4
+    if depth == 32
+        return 0
+    -1
+
+// CHIP_I2S_CTRL's I2S_MODE and LRALIGN fields for a framing in a frame of
+// `clocks` bit clocks; -1 for a framing the part lacks in that frame.
+fn mode_bits(f: AudioFraming, clocks: Int) -> Int
+    match f
+        AudioFraming.AudioPhilips        => 0
+        AudioFraming.AudioLeftJustified  => 0x0002
+        AudioFraming.AudioRightJustified => rj_bits(clocks)
+        AudioFraming.AudioDspA           => 0x0008
+        AudioFraming.AudioDspB           => 0x000A
+        AudioFraming.AudioPdm            => -1
+
+fn rj_bits(clocks: Int) -> Int
+    if clocks == 64
+        return 0x0004
+    -1
 
 // The I2S settings for a format: the board drives the clocks unless the
 // codec does.
@@ -459,11 +493,19 @@ pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
     var role = I2sRole.I2sMaster
     if f.codec_is_master
         role = I2sRole.I2sSlave
-    var layout = I2sFormat.I2sPhilips
-    if f.framing == AudioFraming.AudioLeftJustified
-        layout = I2sFormat.I2sLeftJustified
     I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
-                role: role, format: layout }
+                slot_bits: f.slot_bits, role: role, format: layout_of(f.framing) }
+
+// The handle's framing for a codec framing.  A PDM stream has no I2S form;
+// `i2s_ctrl_of` refuses it before this is asked, and it answers I2S.
+fn layout_of(f: AudioFraming) -> I2sFormat
+    match f
+        AudioFraming.AudioPhilips        => I2sFormat.I2sPhilips
+        AudioFraming.AudioLeftJustified  => I2sFormat.I2sLeftJustified
+        AudioFraming.AudioRightJustified => I2sFormat.I2sRightJustified
+        AudioFraming.AudioDspA           => I2sFormat.I2sDspA
+        AudioFraming.AudioDspB           => I2sFormat.I2sDspB
+        AudioFraming.AudioPdm            => I2sFormat.I2sPhilips
 
 // The clock for a format, or `None` when the codec cannot make it: a mono
 // format (the part frames two slots), a depth `i2s_ctrl_of` refuses, or a
@@ -602,6 +644,15 @@ pub fn i2s_start<S: I2s>(i2s: S, f: AudioFormat) -> Bool [hw]
         return false
     i2s.enable()
 
+// Starts the part for a format, which is `AudioCodec.codec_start`: the board's
+// I2S handle configured and enabled so that SYS_MCLK runs, then the chip
+// identified and left quiet (`start`).  0 microseconds to wait, or -1 when the
+// handle refused the format or the part did not answer as an SGTL5000.
+pub fn clock_start<P: Sgtl5000Port, S: I2s>(p: P, i2s: S, f: AudioFormat) -> Int [hw]
+    if not i2s_start(i2s, f) or not start(p)
+        return -1
+    0
+
 // Programs the codec for a format and configures and enables the board's I2S
 // handle for it: the clock found, the handle configured and enabled, then the
 // clock registers and the serial port.
@@ -650,6 +701,69 @@ pub fn mute_set<P: Sgtl5000Port>(p: P, on: Bool) -> Bool [hw]
 pub fn mute_get<P: Sgtl5000Port>(p: P) -> ?Bool [hw]
     let Some(v) = reg_read(p, ADCDAC_CTRL) else return None
     Some((v & DAC_MUTE_BITS) == DAC_MUTE_BITS)
+
+// The ANA_CTRL mute bit of an analogue path: MUTE_HP for the headphone,
+// MUTE_LO for the line out, MUTE_ADC for the input; 0 for any other path.
+fn ana_mute_bit(path: CodecPath) -> Int
+    match path
+        CodecPath.CodecHeadphone => 0x0010
+        CodecPath.CodecLine      => 0x0100
+        CodecPath.CodecInput     => 0x0001
+        _                        => 0
+
+// Mutes or unmutes one path.  The output is `mute_set`, the whole sequence of
+// the DAC and both analogue outputs; the DAC is its soft mute alone; the
+// headphone, the line out and the input are their ANA_CTRL mute bits.  The
+// speaker and the ADC (the part's ADC gain is analogue and sits on the input)
+// answer false.
+pub fn path_mute_set<P: Sgtl5000Port>(p: P, path: CodecPath, on: Bool) -> Bool [hw]
+    if path == CodecPath.CodecOutput
+        return mute_set(p, on)
+    if path == CodecPath.CodecDac
+        var dflags = 0
+        if on
+            dflags = DAC_MUTE_BITS
+        return reg_update(p, ADCDAC_CTRL, DAC_MUTE_BITS, dflags)
+    let bit = ana_mute_bit(path)
+    if bit == 0
+        return false
+    var flags = 0
+    if on
+        flags = bit
+    reg_update(p, ANA_CTRL, bit, flags)
+
+// Whether one path is muted, on the same paths as `path_mute_set`; `None` for
+// the others and when the part did not answer.
+pub fn path_mute_get<P: Sgtl5000Port>(p: P, path: CodecPath) -> ?Bool [hw]
+    if path == CodecPath.CodecOutput or path == CodecPath.CodecDac
+        return mute_get(p)
+    let bit = ana_mute_bit(path)
+    if bit == 0
+        return None
+    let Some(v) = reg_read(p, ANA_CTRL) else return None
+    Some((v & bit) != 0)
+
+// The ANA_POWER bits of an output driver: the headphone amplifier and its
+// capless stage, or the line-out amplifier; 0 for any other path.
+fn driver_bits(path: CodecPath) -> Int
+    match path
+        CodecPath.CodecHeadphone => 0x0014
+        CodecPath.CodecLine      => 0x0001
+        _                        => 0
+
+// Powers one output driver up or down in ANA_POWER, which is what
+// `AudioCodec.codec_select_output` asks: the headphone (HEADPHONE_POWERUP and
+// CAPLESS_HEADPHONE_POWERUP) or the line out (LINEOUT_POWERUP).  The output
+// stays as muted as it was.  False for any other path, which the part has not
+// as a separate driver.
+pub fn output_select<P: Sgtl5000Port>(p: P, path: CodecPath, on: Bool) -> Bool [hw]
+    let bits = driver_bits(path)
+    if bits == 0
+        return false
+    var flags = 0
+    if on
+        flags = bits
+    reg_update(p, ANA_POWER, bits, flags)
 
 // The headphone volume code for a gain: +12 dB is code 0, 0 dB code 24 and
 // -51.5 dB code 127, in 0.5 dB steps; `None` below -51.5 dB, and +12 dB
@@ -714,25 +828,33 @@ fn adc_gain_get<P: Sgtl5000Port>(p: P) -> ?MilliDb [hw]
     let Some(v) = reg_read(p, ANA_ADC_CTRL) else return None
     Some(MilliDb { mdb: adc_volume_mdb(AdcVolume { m6: (v & 0x0100) != 0, code: v & 0x0F }) })
 
-// Sets the headphone volume or the ADC volume to the largest step at or
-// below `g`: the gain set, or `None` when `g` is below the path's range or
-// the part did not take it.  The output gain is the headphone volume of both
-// channels, +12 to -51.5 dB; the line-out has its own reference-relative
-// level, `lineout_level_set`, and the DAC's digital volume is
-// `dac_volume_set`.  The input gain is the ADC volume of both channels,
-// -6 to +22.5 dB; the microphone amplifier is `mic_gain_set`.
+// Sets the gain of a path to the largest step at or below `g`: the gain set,
+// or `None` when `g` is below the path's range, the part has no such path or
+// it did not take the gain.  The output and the headphone are the headphone
+// volume of both channels, +12 to -51.5 dB; the DAC is its digital volume,
+// `dac_volume_set`; the input is the ADC volume of both channels, -6 to
+// +22.5 dB (the microphone amplifier is `mic_gain_set`).  The line out has no
+// gain here: its level is a code relative to the reference (`lineout_level_set`),
+// not a gain in decibels, and the part has neither a speaker output nor a
+// digital ADC volume.
 pub fn gain_set<P: Sgtl5000Port>(p: P, path: CodecPath, g: MilliDb) -> ?MilliDb [hw]
     match path
-        CodecPath.CodecOutput => hp_gain_set(p, g)
-        CodecPath.CodecInput  => adc_gain_set(p, g)
+        CodecPath.CodecOutput    => hp_gain_set(p, g)
+        CodecPath.CodecHeadphone => hp_gain_set(p, g)
+        CodecPath.CodecDac       => dac_volume_set(p, g)
+        CodecPath.CodecInput     => adc_gain_set(p, g)
+        _                        => None
 
-// The gain of a path as the part holds it, or `None` when it did not
-// answer.  The output gain is the left headphone volume, the input gain the
-// left ADC volume.
+// The gain of a path as the part holds it, or `None` when the part has no such
+// path or did not answer.  The output and the headphone are the left headphone
+// volume, the DAC its digital volume, the input the left ADC volume.
 pub fn gain_get<P: Sgtl5000Port>(p: P, path: CodecPath) -> ?MilliDb [hw]
     match path
-        CodecPath.CodecOutput => hp_gain_get(p)
-        CodecPath.CodecInput  => adc_gain_get(p)
+        CodecPath.CodecOutput    => hp_gain_get(p)
+        CodecPath.CodecHeadphone => hp_gain_get(p)
+        CodecPath.CodecDac       => dac_volume_get(p)
+        CodecPath.CodecInput     => adc_gain_get(p)
+        _                        => None
 
 // ── Settings the trait has no place for ──────────────────────────────
 
@@ -773,7 +895,10 @@ pub fn ramp_set<P: Sgtl5000Port>(p: P, on: Bool, expo: Bool) -> Bool [hw]
     reg_update(p, ADCDAC_CTRL, 0x0300, flags)
 
 // The line-out level code, 0 to 31, 0.5 dB steps: the level that is full scale
-// follows `lo_vol_code` for the supplies in use.  False above 31.
+// follows `lo_vol_code` for the supplies in use.  False above 31.  It is a code
+// and not a gain, so `AudioCodec` has no place for it (planning page 3.5, row
+// "AudioCodec", per-output selection: the line-out gain is not expressible as a
+// `MilliDb`).
 pub fn lineout_level_set<P: Sgtl5000Port>(p: P, code: Int) -> Bool [hw]
     if code < 0 or code > 31
         return false
@@ -869,18 +994,6 @@ pub fn mic_bias_set<P: Sgtl5000Port>(p: P, ohms: Int, mv: Int) -> Bool [hw]
         return false
     reg_update(p, MIC_CTRL, 0x0370, (r << 8) | (((mv - 1250) / 250) << 4))
 
-// Puts the serial port in the right-justified format: the 64 clock frame, as
-// 32 clocks are not supported with it.
-pub fn rj_format_set<P: Sgtl5000Port>(p: P) -> Bool [hw]
-    reg_update(p, I2S_CTRL, 0x010E, 0x0004)
-
-// Puts the serial port in PCM mode, A (`b` false) or B (`b` true).
-pub fn pcm_format_set<P: Sgtl5000Port>(p: P, b: Bool) -> Bool [hw]
-    var flags = 0x0008
-    if b
-        flags = flags | 0x0002
-    reg_update(p, I2S_CTRL, 0x000E, flags)
-
 // Whether the PLL is locked; `None` when the part did not answer.
 pub fn pll_locked<P: Sgtl5000Port>(p: P) -> ?Bool [hw]
     let Some(s) = reg_read(p, ANA_STATUS) else return None
@@ -905,7 +1018,8 @@ pub struct Sgtl5000<S: I2s>
 // The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
 // for its samples.  Nothing is sent.  A struct with a generic field cannot
 // be a `@value`, so the codec is one cell of the arena, built in a `system`
-// block, the one allocation of the package.
+// block, the one allocation of the package (planning page 3.4, row "a generic
+// struct").
 pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Sgtl5000Config) -> Sgtl5000<S>
     system
         return Sgtl5000 { bus: bus, w: w, i2s: i2s, cfg: cfg }
@@ -924,16 +1038,6 @@ impl Sgtl5000Port for Sgtl5000
         BoardTimer { id: 0 }.delay_ms(ms)
 
 impl Sgtl5000
-    // Starts the I2S handle for a format so that SYS_MCLK runs
-    // (`i2s_start`).  A program calls it before `begin`.
-    fn start_clock(self, f: AudioFormat) -> Bool [hw]
-        i2s_start(self.i2s, f)
-
-    // Brings the part up (`start`): the chip ID and a quiet part.  SYS_MCLK
-    // has to be running, and the caller has powered the part.
-    fn begin(self) -> Bool [hw]
-        start(self)
-
     // One register, `None` when the part did not answer, and a write.
     fn reg(self, r: Int) -> ?Int [hw]
         reg_read(self, r)
@@ -941,13 +1045,7 @@ impl Sgtl5000
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
         reg_write(self, r, v)
 
-    // The DAC's digital volume, its ramp and the line-out level.
-    fn set_dac_volume(self, g: MilliDb) -> ?MilliDb [hw]
-        dac_volume_set(self, g)
-
-    fn dac_volume(self) -> ?MilliDb [hw]
-        dac_volume_get(self)
-
+    // The DAC's volume ramp and the line-out level.
     fn set_ramp(self, on: Bool, expo: Bool) -> Bool [hw]
         ramp_set(self, on, expo)
 
@@ -974,13 +1072,7 @@ impl Sgtl5000
     fn set_mic_bias(self, ohms: Int, mv: Int) -> Bool [hw]
         mic_bias_set(self, ohms, mv)
 
-    // The right-justified and PCM formats, and the status bits.
-    fn set_rj_format(self) -> Bool [hw]
-        rj_format_set(self)
-
-    fn set_pcm_format(self, b: Bool) -> Bool [hw]
-        pcm_format_set(self, b)
-
+    // The status bits.
     fn locked(self) -> ?Bool [hw]
         pll_locked(self)
 
@@ -1009,6 +1101,18 @@ impl AudioCodec[hw] for Sgtl5000
 
     fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw]
         gain_get(self, path)
+
+    fn codec_start(self, f: AudioFormat) -> Int [hw]
+        clock_start(self, self.i2s, f)
+
+    fn codec_select_output(self, path: CodecPath, on: Bool) -> Bool [hw]
+        output_select(self, path, on)
+
+    fn codec_set_path_mute(self, path: CodecPath, on: Bool) -> Bool [hw]
+        path_mute_set(self, path, on)
+
+    fn codec_path_muted(self, path: CodecPath) -> ?Bool [hw]
+        path_mute_get(self, path)
 
 impl Identifiable[hw] for Sgtl5000
     // PARTID, 0xA0, as `who`, and REVID as `rev`.
