@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
-are path dependencies until they are published.
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
 
 - `codec_start(f)` replaces the inherent `start_clock` and `begin`: it starts the
   I2S handle so that SYS_MCLK runs, reads the chip ID and leaves the part quiet,

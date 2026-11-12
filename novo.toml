@@ -1,6 +1,6 @@
 [package]
 name        = "sgtl5000-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for NXP's SGTL5000 low-power stereo codec with headphone amplifier on an I2C control bus with 16-bit registers and a board's I2S handle: the chip ID, the power-up sequence of the data sheet in its order for an internal or external VDDD and for low and high supplies, the clock from SYS_FS and the MCLK ratio or the PLL, the I2S port, the routing, the DAC volume ramp and mute, the headphone and line-out volumes and mutes, the input choice, the microphone gain and bias, as devices-nv's AudioCodec and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
